@@ -7,7 +7,7 @@ use crate::{
 
 use super::{ColumnBuffer, Indicator};
 
-use log::debug;
+use log::{debug, info};
 use odbc_sys::{CDataType, NULL_DATA};
 use std::{cmp::min, ffi::c_void, mem::size_of, num::NonZeroUsize, panic};
 use widestring::U16Str;
@@ -142,6 +142,9 @@ impl<C> TextColumn<C> {
     /// element wise.
     pub fn has_truncated_values(&self, num_rows: usize) -> Option<Indicator> {
         let max_bin_length = self.max_str_len * size_of::<C>();
+
+        info!("Text column: max string length: {}", self.max_str_len);
+        info!("Text column: max bin length: {}", max_bin_length);
         self.indicators
             .iter()
             .copied()
@@ -335,6 +338,11 @@ where
 
     fn has_truncated_values(&self, num_rows: usize) -> Option<Indicator> {
         let max_bin_length = self.max_str_len * size_of::<C>();
+        info!(
+            "Text Column buffer: max string length: {}",
+            self.max_str_len
+        );
+        info!("Text Column buffer: make bin length: {}", max_bin_length);
         self.indicators
             .iter()
             .copied()

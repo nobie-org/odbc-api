@@ -6,7 +6,7 @@ use crate::{
     DataType, Error,
 };
 
-use log::debug;
+use log::{debug, info};
 use odbc_sys::{CDataType, NULL_DATA};
 use std::{cmp::min, ffi::c_void, num::NonZeroUsize};
 
@@ -108,6 +108,8 @@ impl BinColumn {
     /// element wise and reports one indicator which indicates a size large than the maximum element
     /// size, if it exits.
     pub fn has_truncated_values(&self, num_rows: usize) -> Option<Indicator> {
+        info!("Checking for truncated values in binary column buffer.");
+        info!("max_bin_length: {}", self.max_len);
         self.indicators
             .iter()
             .copied()
