@@ -1,10 +1,11 @@
-use std::intrinsics::transmute;
+use std::{intrinsics::transmute, time::Duration};
 
 use crate::{
-    handles::{AsStatementRef, SqlText, Statement},
+    cancel::{run_or_cancel, run_or_cancel_stmt},
+    handles::{AsStatementRef, SqlResult, SqlText, Statement},
     parameter::Blob,
     sleep::wait_for,
-    CursorImpl, CursorPolling, Error, ParameterCollectionRef, Sleep,
+    Cancelable, CursorImpl, CursorPolling, Error, ParameterCollectionRef, Sleep,
 };
 
 /// Shared implementation for executing a query with parameters between [`crate::Connection`],
@@ -126,6 +127,72 @@ where
     } else {
         // Safe: `statement` is in cursor state.
         let cursor = CursorImpl::new(statement);
+        Ok(Some(cursor))
+    }
+}
+
+/// # Safety
+///
+/// * Execute may dereference pointers to bound parameters, so these must guaranteed to be valid
+///   then calling this function.
+/// * Furthermore all bound delayed parameters must be of type `*mut &mut dyn Blob`.
+pub unsafe fn execute_cancelable<S>(
+    mut statement: S,
+    query: Option<&SqlText<'_>>,
+    sleep: Duration,
+    cancelable: impl Cancelable,
+) -> Result<Option<CursorPolling<S>>, Error>
+where
+    S: AsStatementRef,
+{
+    let mut stmt = statement.as_stmt_ref();
+    let result = if let Some(sql) = query {
+        // We execute an unprepared "one shot query"
+        run_or_cancel_stmt(&mut stmt, |stmt| stmt.exec_direct(sql), sleep, &cancelable)
+    } else {
+        // We execute a prepared query
+        run_or_cancel_stmt(&mut stmt, |stmt| stmt.execute(), sleep, &cancelable)
+    }
+    .map_cancelable_sql_result();
+
+    // if let SqlResult::Success(Some(res)|
+
+    // If delayed parameters (e.g. input streams) are bound we might need to put data in order to
+    // execute.
+    let need_data = result
+        .on_success(|| false)
+        .into_result_with(&stmt, Some(false), Some(true))?;
+
+    if need_data {
+        // Check if any delayed parameters have been bound which stream data to the database at
+        // statement execution time. Loops over each bound stream.
+        while let Some(blob_ptr) = stmt.param_data().into_result(&stmt)? {
+            // The safe interfaces currently exclusively bind pointers to `Blob` trait objects
+            let blob_ptr: *mut &mut dyn Blob = transmute(blob_ptr);
+            let blob_ref = &mut *blob_ptr;
+            // Loop over all batches within each blob
+            while let Some(batch) = blob_ref.next_batch().map_err(Error::FailedReadingInput)? {
+                let result = run_or_cancel_stmt(
+                    &mut stmt,
+                    |stmt| stmt.put_binary_batch(batch),
+                    sleep,
+                    &cancelable,
+                );
+                result.map_cancelable_sql_result().into_result(&stmt)?;
+            }
+        }
+    }
+
+    // Check if a result set has been created.
+    let num_result_cols =
+        run_or_cancel_stmt(&mut stmt, |stmt| stmt.num_result_cols(), sleep, &cancelable)
+            .map_cancelable_sql_result()
+            .into_result(&stmt)?;
+    if num_result_cols == 0 {
+        Ok(None)
+    } else {
+        // Safe: `statement` is in cursor state.
+        let cursor = CursorPolling::new(statement);
         Ok(Some(cursor))
     }
 }

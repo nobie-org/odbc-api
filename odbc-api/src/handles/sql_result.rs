@@ -64,6 +64,25 @@ impl<T> SqlResult<T> {
     }
 }
 
+impl<T> SqlResult<Option<T>> {
+    pub fn map_cancelable_sql_result(self) -> SqlResult<T> {
+        match self {
+            SqlResult::Success(Some(res)) => SqlResult::Success(res),
+            SqlResult::SuccessWithInfo(Some(res)) => SqlResult::SuccessWithInfo(res),
+            SqlResult::Success(None) => SqlResult::Error {
+                function: "cancelled",
+            },
+            SqlResult::SuccessWithInfo(None) => SqlResult::Error {
+                function: "cancelled",
+            },
+            SqlResult::Error { function } => SqlResult::Error { function },
+            SqlResult::NeedData => SqlResult::NeedData,
+            SqlResult::NoData => SqlResult::NoData,
+            SqlResult::StillExecuting => SqlResult::StillExecuting,
+        }
+    }
+}
+
 pub trait ExtSqlReturn {
     fn into_sql_result(self, function_name: &'static str) -> SqlResult<()>;
 }

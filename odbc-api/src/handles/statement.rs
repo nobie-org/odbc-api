@@ -12,9 +12,9 @@ use super::{
 use log::debug;
 use odbc_sys::{
     Desc, FreeStmtOption, HDbc, HStmt, Handle, HandleType, Len, ParamType, Pointer, SQLBindCol,
-    SQLBindParameter, SQLCloseCursor, SQLDescribeParam, SQLExecute, SQLFetch, SQLFreeStmt,
-    SQLGetData, SQLMoreResults, SQLNumParams, SQLNumResultCols, SQLParamData, SQLPutData,
-    SQLRowCount, SqlDataType, SqlReturn, StatementAttribute, IS_POINTER,
+    SQLBindParameter, SQLCancel, SQLCloseCursor, SQLDescribeParam, SQLExecute, SQLFetch,
+    SQLFreeStmt, SQLGetData, SQLMoreResults, SQLNumParams, SQLNumResultCols, SQLParamData,
+    SQLPutData, SQLRowCount, SqlDataType, SqlReturn, StatementAttribute, IS_POINTER,
 };
 use std::{ffi::c_void, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr::null_mut};
 
@@ -342,6 +342,10 @@ pub trait Statement: AsHandle {
     /// Close an open cursor.
     fn close_cursor(&mut self) -> SqlResult<()> {
         unsafe { SQLCloseCursor(self.as_sys()) }.into_sql_result("SQLCloseCursor")
+    }
+
+    fn cancel(&self) -> SqlResult<()> {
+        unsafe { SQLCancel(self.as_sys()).into_sql_result("SQLCancel") }
     }
 
     /// Send an SQL statement to the data source for preparation. The application can include one or

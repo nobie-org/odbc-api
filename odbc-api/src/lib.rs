@@ -25,11 +25,13 @@ mod sleep;
 mod statement_connection;
 
 pub mod buffers;
+mod cancel;
 pub mod guide;
 pub mod handles;
 pub mod parameter;
 
 pub use self::{
+    cancel::Cancelable,
     columnar_bulk_inserter::{BoundInputSlice, ColumnarBulkInserter},
     concurrent_block_cursor::ConcurrentBlockCursor,
     connection::{escape_attribute_value, Connection, ConnectionOptions},
