@@ -1,7 +1,10 @@
 use crate::{
     buffers::{AnyBuffer, BufferDesc, ColumnBuffer, TextColumn},
     execute::execute_with_parameters,
-    handles::{AsStatementRef, HasDataType, ParameterDescription, Statement, StatementRef},
+    handles::{
+        AsStatementRef, CancellingLock, HasDataType, ParameterDescription, Statement,
+        StatementCancelHandle, StatementRef,
+    },
     ColumnarBulkInserter, CursorImpl, Error, ParameterCollectionRef, ResultSetMetadata,
 };
 
@@ -11,7 +14,7 @@ pub struct Prepared<S> {
     statement: S,
 }
 
-impl<S> Prepared<S> {
+impl<S: AsStatementRef> Prepared<S> {
     pub(crate) fn new(statement: S) -> Self {
         Self { statement }
     }
@@ -46,6 +49,13 @@ where
     ) -> Result<Option<CursorImpl<StatementRef<'_>>>, Error> {
         let stmt = self.statement.as_stmt_ref();
         execute_with_parameters(move || Ok(stmt), None, params)
+    }
+
+    pub fn cancel_handle(&mut self) -> StatementCancelHandle {
+        StatementCancelHandle::new(
+            self.as_stmt_ref().as_sys(),
+            self.as_stmt_ref().cancelling_lock(),
+        )
     }
 
     /// Describes parameter marker associated with a prepared SQL statement.

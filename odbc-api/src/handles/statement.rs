@@ -10,14 +10,22 @@ use super::{
     sql_result::ExtSqlReturn,
     CData, Descriptor, SqlChar, SqlResult, SqlText,
 };
-use log::debug;
+use log::{debug, info};
 use odbc_sys::{
     Desc, FreeStmtOption, HDbc, HStmt, Handle, HandleType, Len, ParamType, Pointer, SQLBindCol,
     SQLBindParameter, SQLCancel, SQLCloseCursor, SQLDescribeParam, SQLExecute, SQLFetch,
     SQLFreeStmt, SQLGetData, SQLMoreResults, SQLNumParams, SQLNumResultCols, SQLParamData,
     SQLPutData, SQLRowCount, SqlDataType, SqlReturn, StatementAttribute, IS_POINTER,
 };
-use std::{ffi::c_void, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr::null_mut};
+use std::{
+    ffi::c_void,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    num::NonZeroUsize,
+    ptr::null_mut,
+    rc::Weak,
+    sync::{Arc, Mutex},
+};
 
 #[cfg(feature = "odbc_version_3_80")]
 use odbc_sys::SQLCompleteAsync;
@@ -42,6 +50,7 @@ use odbc_sys::{
 pub struct StatementImpl<'s> {
     parent: PhantomData<&'s HDbc>,
     handle: HStmt,
+    cancelling_lock: Arc<CancellingLock>,
 }
 
 unsafe impl<'c> AsHandle for StatementImpl<'c> {
@@ -69,6 +78,7 @@ impl<'s> StatementImpl<'s> {
     pub unsafe fn new(handle: HStmt) -> Self {
         Self {
             handle,
+            cancelling_lock: Arc::new(CancellingLock::new()),
             parent: PhantomData,
         }
     }
@@ -86,6 +96,7 @@ impl<'s> StatementImpl<'s> {
         StatementRef {
             parent: self.parent,
             handle: self.handle,
+            cancelling_lock: Arc::downgrade(&self.cancelling_lock),
         }
     }
 }
@@ -97,13 +108,18 @@ impl<'s> StatementImpl<'s> {
 pub struct StatementRef<'s> {
     parent: PhantomData<&'s HDbc>,
     handle: HStmt,
+    cancelling_lock: std::sync::Weak<CancellingLock>,
 }
 
 impl<'s> StatementRef<'s> {
-    pub(crate) unsafe fn new(handle: HStmt) -> Self {
+    pub(crate) unsafe fn new(
+        handle: HStmt,
+        cancelling_lock: std::sync::Weak<CancellingLock>,
+    ) -> Self {
         Self {
             handle,
             parent: PhantomData,
+            cancelling_lock,
         }
     }
 }
@@ -111,6 +127,10 @@ impl<'s> StatementRef<'s> {
 impl<'s> Statement for StatementRef<'s> {
     fn as_sys(&self) -> HStmt {
         self.handle
+    }
+
+    fn cancelling_lock(&self) -> std::sync::Weak<CancellingLock> {
+        self.cancelling_lock.clone()
     }
 }
 
@@ -146,20 +166,42 @@ impl<'o> AsStatementRef for &mut StatementImpl<'o> {
 
 impl<'s> AsStatementRef for StatementRef<'s> {
     fn as_stmt_ref(&mut self) -> StatementRef<'_> {
-        unsafe { StatementRef::new(self.handle) }
+        unsafe { StatementRef::new(self.handle, self.cancelling_lock.clone()) }
     }
 }
 
+#[derive(Clone)]
 pub struct StatementCancelHandle {
     statement_handle: HStmt,
-    cancelling_lock: CancellingLock,
+    cancelling_lock: std::sync::Weak<CancellingLock>,
 }
 
 impl StatementCancelHandle {
+    // pub(crate) fn inner_lock(&self) -> CancellingLock {
+    //     self.cancelling_lock.clone()
+    // }
+
     pub fn cancel(&self) -> SqlResult<()> {
-        self.cancelling_lock.call_cancel(|| unsafe {
-            SQLCancel(self.statement_handle).into_sql_result("SQLCancel")
-        })
+        if let Some(cancelling_lock) = self.cancelling_lock.upgrade() {
+            cancelling_lock.call_cancel(|| unsafe {
+                info!("Cancelling statement inside call_cancel");
+                let res = SQLCancel(self.statement_handle).into_sql_result("SQLCancel");
+                info!("Statement cancelled: {:?}", res);
+                res
+            })
+        } else {
+            SqlResult::Success(())
+        }
+    }
+
+    pub(crate) fn new(
+        statement_handle: HStmt,
+        cancelling_lock: std::sync::Weak<CancellingLock>,
+    ) -> Self {
+        Self {
+            statement_handle,
+            cancelling_lock,
+        }
     }
 }
 
@@ -176,6 +218,8 @@ unsafe impl Send for StatementCancelHandle {}
 pub trait Statement: AsHandle {
     /// Gain access to the underlying statement handle without transferring ownership to it.
     fn as_sys(&self) -> HStmt;
+
+    fn cancelling_lock(&self) -> std::sync::Weak<CancellingLock>;
 
     /// Binds application data buffers to columns in the result set.
     ///
@@ -211,11 +255,8 @@ pub trait Statement: AsHandle {
         unsafe { SQLCancel(self.as_sys()) }.into_sql_result("SQLCancel")
     }
 
-    fn cancel_handle(&mut self, cancelling_lock: CancellingLock) -> StatementCancelHandle {
-        StatementCancelHandle {
-            statement_handle: self.as_sys(),
-            cancelling_lock,
-        }
+    fn cancel_handle(&mut self) -> StatementCancelHandle {
+        StatementCancelHandle::new(self.as_sys(), self.cancelling_lock())
     }
 
     /// Returns the next row set in the result set.
@@ -230,7 +271,10 @@ pub trait Statement: AsHandle {
     ///
     /// Fetch dereferences bound column pointers.
     unsafe fn fetch(&mut self) -> SqlResult<()> {
-        SQLFetch(self.as_sys()).into_sql_result("SQLFetch")
+        self.cancelling_lock()
+            .upgrade()
+            .unwrap()
+            .perform_cancelable(|| SQLFetch(self.as_sys()).into_sql_result("SQLFetch"))
     }
 
     /// Retrieves data for a single column in the result set or for a single parameter.
@@ -358,12 +402,17 @@ pub trait Statement: AsHandle {
     /// * [`SqlResult::NoData`] if a searched update or delete statement did not affect any rows at
     ///   the data source.
     unsafe fn exec_direct(&mut self, statement: &SqlText) -> SqlResult<()> {
-        sql_exec_direc(
-            self.as_sys(),
-            statement.ptr(),
-            statement.len_char().try_into().unwrap(),
-        )
-        .into_sql_result("SQLExecDirect")
+        self.cancelling_lock()
+            .upgrade()
+            .unwrap()
+            .perform_cancelable(|| {
+                sql_exec_direc(
+                    self.as_sys(),
+                    statement.ptr(),
+                    statement.len_char().try_into().unwrap(),
+                )
+                .into_sql_result("SQLExecDirect")
+            })
     }
 
     /// Close an open cursor.
@@ -402,7 +451,15 @@ pub trait Statement: AsHandle {
     /// * [`SqlResult::NoData`] if a searched update or delete statement did not affect any rows at
     ///   the data source.
     unsafe fn execute(&mut self) -> SqlResult<()> {
-        SQLExecute(self.as_sys()).into_sql_result("SQLExecute")
+        self.cancelling_lock()
+            .upgrade()
+            .unwrap()
+            .perform_cancelable(|| {
+                let res = SQLExecute(self.as_sys());
+                info!("SQLExecute returned: {:?}", res);
+
+                res.into_sql_result("SQLExecute")
+            })
     }
 
     /// Number of columns in result set.
@@ -1003,6 +1060,10 @@ impl<'o> Statement for StatementImpl<'o> {
     /// Gain access to the underlying statement handle without transferring ownership to it.
     fn as_sys(&self) -> HStmt {
         self.handle
+    }
+
+    fn cancelling_lock(&self) -> std::sync::Weak<CancellingLock> {
+        Arc::downgrade(&self.cancelling_lock)
     }
 }
 

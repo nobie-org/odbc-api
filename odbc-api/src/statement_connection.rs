@@ -1,7 +1,12 @@
+use std::sync::Arc;
+
 use odbc_sys::{HStmt, Handle, HandleType};
 
 use crate::{
-    handles::{drop_handle, AsHandle, AsStatementRef, Statement, StatementRef},
+    handles::{
+        drop_handle, AsHandle, AsStatementRef, CancellingLock, Statement, StatementCancelHandle,
+        StatementRef,
+    },
     Connection,
 };
 
@@ -9,18 +14,24 @@ use crate::{
 pub struct StatementConnection<'env> {
     handle: HStmt,
     _parent: Connection<'env>,
+    cancelling_lock: Arc<CancellingLock>,
 }
 
 impl<'env> StatementConnection<'env> {
-    pub(crate) unsafe fn new(handle: HStmt, parent: Connection<'env>) -> Self {
+    pub(crate) unsafe fn new(
+        handle: HStmt,
+        parent: Connection<'env>,
+        cancelling_lock: Arc<CancellingLock>,
+    ) -> Self {
         Self {
             _parent: parent,
+            cancelling_lock,
             handle,
         }
     }
 
     pub fn as_stmt_ref(&mut self) -> StatementRef<'_> {
-        unsafe { StatementRef::new(self.handle) }
+        unsafe { StatementRef::new(self.handle, self.cancelling_lock()) }
     }
 }
 
@@ -68,6 +79,10 @@ unsafe impl AsHandle for StatementConnection<'_> {
 impl Statement for StatementConnection<'_> {
     fn as_sys(&self) -> HStmt {
         self.handle
+    }
+
+    fn cancelling_lock(&self) -> std::sync::Weak<CancellingLock> {
+        Arc::downgrade(&self.cancelling_lock)
     }
 }
 

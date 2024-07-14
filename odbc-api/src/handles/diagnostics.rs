@@ -5,6 +5,7 @@ use super::{
     buffer::{clamp_small_int, mut_buf_ptr},
     SqlChar,
 };
+use log::info;
 use odbc_sys::{SqlReturn, SQLSTATE_SIZE};
 use std::fmt;
 
@@ -202,6 +203,9 @@ impl<T: AsHandle + ?Sized> Diagnostics for T {
             native_error,
             text_length,
         };
+
+        info!("SQLGetDiagRec returned: {:?}", result);
+        info!("SQLGetDiagRec returned with code: {:?}", ret);
 
         match ret {
             SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO => Some(result),

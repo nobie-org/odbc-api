@@ -15,6 +15,7 @@ use crate::{
 use std::{
     mem::{size_of, MaybeUninit},
     ptr,
+    sync::Arc,
     thread::panicking,
 };
 
@@ -289,7 +290,6 @@ impl<'s> CursorRow<'s> {
 pub struct CursorImpl<Stmt: AsStatementRef> {
     /// A statement handle in cursor mode.
     statement: Stmt,
-    cancelling_lock: CancellingLock,
 }
 
 impl<S> Drop for CursorImpl<S>
@@ -297,7 +297,12 @@ where
     S: AsStatementRef,
 {
     fn drop(&mut self) {
-        self.cancelling_lock.mark_as_dropped();
+        self.statement
+            .as_stmt_ref()
+            .cancelling_lock()
+            .upgrade()
+            .unwrap()
+            .mark_as_dropped();
         let mut stmt = self.statement.as_stmt_ref();
         if let Err(e) = stmt.close_cursor().into_result(&stmt) {
             match e {
@@ -382,10 +387,7 @@ where
     ///
     /// `statement` must be in Cursor state, for the invariants of this type to hold.
     pub unsafe fn new(statement: S) -> Self {
-        Self {
-            statement,
-            cancelling_lock: Default::default(),
-        }
+        Self { statement }
     }
 
     /// Deconstructs the `CursorImpl` without calling drop. This is a way to get to the underlying
@@ -404,9 +406,7 @@ where
     }
 
     pub fn cancel_handle(&mut self) -> StatementCancelHandle {
-        self.statement
-            .as_stmt_ref()
-            .cancel_handle(self.cancelling_lock.clone())
+        self.statement.as_stmt_ref().cancel_handle()
     }
 }
 

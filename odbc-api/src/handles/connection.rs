@@ -10,13 +10,19 @@ use super::{
     statement::StatementImpl,
     OutputStringBuffer, SqlResult,
 };
-use log::debug;
+use log::{debug, info};
 use odbc_sys::{
     CompletionType, ConnectionAttribute, DriverConnectOption, HDbc, HEnv, HStmt, HWnd, Handle,
     HandleType, InfoType, Pointer, SQLAllocHandle, SQLCancelHandle as sql_cancel_handle,
     SQLDisconnect, SQLEndTran, IS_UINTEGER,
 };
-use std::{ffi::c_void, marker::PhantomData, mem::size_of, ptr::null_mut, sync::Arc};
+use std::{
+    ffi::c_void,
+    marker::PhantomData,
+    mem::size_of,
+    ptr::null_mut,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 #[cfg(feature = "narrow")]
 use odbc_sys::{
@@ -32,24 +38,135 @@ use odbc_sys::{
     SQLSetConnectAttrW as sql_set_connect_attr,
 };
 
-#[derive(Clone, Default)]
-pub(crate) struct CancellingLock {
-    lock: Arc<std::sync::Mutex<bool>>,
+#[derive(Default, Debug)]
+enum StatementState {
+    #[default]
+    Idle,
+    Dropped,
+    CancelableOperationInProgress,
 }
 
-impl CancellingLock {
-    pub fn mark_as_dropped(&self) {
-        *self.lock.lock().unwrap() = true;
+#[derive(Default)]
+struct CancelLockState {
+    dropped: AtomicBool,
+    cancelable_operation_in_progress: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+impl CancelLockState {
+    fn set_dropped(&self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn call_cancel(&self, cancel_fn: impl FnOnce() -> SqlResult<()>) -> SqlResult<()> {
-        let dropped = self.lock.lock().unwrap();
-        if *dropped {
-            SqlResult::Error {
-                function: "called cancel after connection was dropped",
+    fn set_statement_state(&self, state: StatementState) {
+        match state {
+            StatementState::Idle => {
+                self.cancelable_operation_in_progress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
+            StatementState::CancelableOperationInProgress => {
+                self.cancelable_operation_in_progress
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            StatementState::Dropped => {
+                self.set_dropped();
+            }
+        }
+    }
+
+    fn statement_state(&self) -> StatementState {
+        if self.dropped.load(std::sync::atomic::Ordering::Relaxed) {
+            StatementState::Dropped
+        } else if self
+            .cancelable_operation_in_progress
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            StatementState::CancelableOperationInProgress
         } else {
-            cancel_fn()
+            StatementState::Idle
+        }
+    }
+}
+
+pub struct CancellingLock {
+    inner: Arc<CancelLockState>,
+}
+
+impl Drop for CancellingLock {
+    fn drop(&mut self) {
+        info!("Dropping CancellingLock.");
+    }
+}
+
+unsafe impl Send for CancellingLock {}
+
+impl CancellingLock {
+    pub(crate) fn new() -> Self {
+        info!("Creating new CancellingLock.");
+        Self {
+            inner: Default::default(),
+        }
+    }
+
+    pub(crate) fn mark_as_dropped(&self) {
+        self.inner.set_statement_state(StatementState::Dropped);
+    }
+
+    pub(crate) fn perform_cancelable<T>(
+        &self,
+        operation: impl FnOnce() -> SqlResult<T>,
+    ) -> SqlResult<T> {
+        info!("cancelable operation started.");
+        self.cancelable_operation_started();
+        info!("cancelable state {:?}", self.inner.statement_state());
+        let instant = std::time::Instant::now();
+        let result = operation();
+        info!(
+            "Cancelable operation took {}.",
+            instant.elapsed().as_nanos()
+        );
+        self.cancelable_operation_finished();
+        result
+    }
+
+    pub(crate) fn cancelable_operation_started(&self) {
+        assert!(matches!(self.inner.statement_state(), StatementState::Idle));
+        self.inner
+            .set_statement_state(StatementState::CancelableOperationInProgress);
+    }
+
+    pub(crate) fn cancelable_operation_finished(&self) {
+        assert!(matches!(
+            self.inner.statement_state(),
+            StatementState::CancelableOperationInProgress
+        ));
+        self.inner.set_statement_state(StatementState::Idle);
+    }
+
+    pub(crate) fn call_cancel(&self, cancel_fn: impl FnOnce() -> SqlResult<()>) -> SqlResult<()> {
+        match &self.inner.statement_state() {
+            StatementState::Dropped => SqlResult::Error {
+                function: "called cancel after connection was dropped",
+            },
+            StatementState::CancelableOperationInProgress => {
+                if self
+                    .inner
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    // info!("Cancel was already called. No need to call it again.");
+                    // return SqlResult::Success(());
+                }
+                self.inner
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                cancel_fn()
+            }
+            StatementState::Idle => {
+                info!("Cancel statment ws not in progress. No need to cancel.");
+                SqlResult::Success(())
+            }
         }
     }
 }
@@ -63,7 +180,6 @@ impl CancellingLock {
 pub struct Connection<'c> {
     parent: PhantomData<&'c HEnv>,
     handle: HDbc,
-    cancelling_lock: CancellingLock,
 }
 
 unsafe impl<'c> AsHandle for Connection<'c> {
@@ -84,29 +200,6 @@ impl<'c> Drop for Connection<'c> {
     }
 }
 
-pub struct ConnectionCancelHandle {
-    handle: HDbc,
-    cancelling_lock: CancellingLock,
-}
-
-impl ConnectionCancelHandle {
-    fn new(handle: HDbc, cancelling_lock: CancellingLock) -> Self {
-        Self {
-            handle,
-            cancelling_lock,
-        }
-    }
-
-    pub fn cancel(&self) -> SqlResult<()> {
-        self.cancelling_lock.call_cancel(|| unsafe {
-            sql_cancel_handle(HandleType::Dbc, self.handle as Handle)
-                .into_sql_result("SQLCancelHandle")
-        })
-    }
-}
-
-unsafe impl Send for ConnectionCancelHandle {}
-
 /// According to the ODBC documentation this is safe. See:
 /// <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/multithreading>
 ///
@@ -124,14 +217,9 @@ impl<'c> Connection<'c> {
     /// Call this method only with a valid (successfully allocated) ODBC connection handle.
     pub unsafe fn new(handle: HDbc) -> Self {
         Self {
-            cancelling_lock: Default::default(),
             handle,
             parent: PhantomData,
         }
-    }
-
-    pub(crate) fn set_dropped(&self) {
-        self.cancelling_lock.mark_as_dropped();
     }
 
     /// Directly acces the underlying ODBC handle.
@@ -171,10 +259,6 @@ impl<'c> Connection<'c> {
             )
             .into_sql_result("SQLConnect")
         }
-    }
-
-    pub fn cancel_handle(&self) -> ConnectionCancelHandle {
-        ConnectionCancelHandle::new(self.as_sys(), self.cancelling_lock.clone())
     }
 
     /// An alternative to `connect`. It supports data sources that require more connection

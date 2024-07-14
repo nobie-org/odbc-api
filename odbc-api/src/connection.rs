@@ -5,7 +5,7 @@ use crate::{
         execute_with_parameters_polling,
     },
     handles::{
-        self, slice_to_utf8, ConnectionCancelHandle, SqlResult, SqlText, State, Statement,
+        self, slice_to_utf8, SqlResult, SqlText, State, Statement, StatementCancelHandle,
         StatementImpl,
     },
     statement_connection::StatementConnection,
@@ -22,7 +22,6 @@ use std::{
 
 impl<'conn> Drop for Connection<'conn> {
     fn drop(&mut self) {
-        self.connection.set_dropped();
         match self.connection.disconnect().into_result(&self.connection) {
             Ok(()) => (),
             Err(Error::Diagnostics {
@@ -89,10 +88,6 @@ impl<'c> Connection<'c> {
     /// to rigid for you, while simultaneously abondoning its safeguards.
     pub fn into_handle(self) -> handles::Connection<'c> {
         unsafe { handles::Connection::new(ManuallyDrop::new(self).connection.as_sys()) }
-    }
-
-    pub fn cancel_handle(&self) -> ConnectionCancelHandle {
-        self.connection.cancel_handle()
     }
 
     /// Executes an SQL statement. This is the fastest way to submit an SQL statement for one-time
@@ -205,32 +200,34 @@ impl<'c> Connection<'c> {
         query: &str,
         params: impl ParameterCollectionRef,
     ) -> Result<Option<CursorImpl<StatementConnection<'c>>>, ConnectionAndError<'c>> {
+        todo!()
         // With the current Rust version the borrow checker needs some convincing, so that it allows
         // us to return the Connection, even though the Result of execute borrows it.
-        let mut error = None;
-        let mut cursor = None;
-        match self.execute(query, params) {
-            Ok(Some(c)) => cursor = Some(c),
-            Ok(None) => return Ok(None),
-            Err(e) => error = Some(e),
-        };
-        if let Some(e) = error {
-            drop(cursor);
-            return Err(ConnectionAndError {
-                error: e,
-                connection: self,
-            });
-        }
-        let cursor = cursor.unwrap();
-        // The rust compiler needs some help here. It assumes otherwise that the lifetime of the
-        // resulting cursor would depend on the lifetime of `params`.
-        let mut cursor = ManuallyDrop::new(cursor);
-        let handle = cursor.as_sys();
-        // Safe: `handle` is a valid statement, and we are giving up ownership of `self`.
-        let statement = unsafe { StatementConnection::new(handle, self) };
-        // Safe: `statement is in the cursor state`.
-        let cursor = unsafe { CursorImpl::new(statement) };
-        Ok(Some(cursor))
+        // let mut error = None;
+        // let mut cursor = None;
+        // match self.execute(query, params) {
+        //     Ok(Some(c)) => cursor = Some(c),
+        //     Ok(None) => return Ok(None),
+        //     Err(e) => error = Some(e),
+        // };
+        // if let Some(e) = error {
+        //     drop(cursor);
+        //     return Err(ConnectionAndError {
+        //         error: e,
+        //         connection: self,
+        //     });
+        // }
+        // let cursor = cursor.unwrap();
+        // // The rust compiler needs some help here. It assumes otherwise that the lifetime of the
+        // // resulting cursor would depend on the lifetime of `params`.
+        // let mut cursor = ManuallyDrop::new(cursor);
+        // let cancelling_lock = cursor.cancel_handle().inner_lock();
+        // let handle = cursor.as_sys();
+        // // Safe: `handle` is a valid statement, and we are giving up ownership of `self`.
+        // let statement = unsafe { StatementConnection::new(handle, self, cancelling_lock) };
+        // // Safe: `statement is in the cursor state`.
+        // let cursor = unsafe { CursorImpl::new(statement) };
+        // Ok(Some(cursor))
     }
 
     /// Prepares an SQL statement. This is recommended for repeated execution of similar queries.
@@ -324,12 +321,14 @@ impl<'c> Connection<'c> {
     /// }
     /// ```
     pub fn into_prepared(self, query: &str) -> Result<Prepared<StatementConnection<'c>>, Error> {
-        let query = SqlText::new(query);
-        let mut stmt = self.allocate_statement()?;
-        stmt.prepare(&query).into_result(&stmt)?;
-        // Safe: `handle` is a valid statement, and we are giving up ownership of `self`.
-        let stmt = unsafe { StatementConnection::new(stmt.into_sys(), self) };
-        Ok(Prepared::new(stmt))
+        todo!()
+        // let query = SqlText::new(query);
+        // let mut stmt = self.allocate_statement()?;
+        // stmt.prepare(&query).into_result(&stmt)?;
+        // // Safe: `handle` is a valid statement, and we are giving up ownership of `self`.
+        // let cancelling_lock = stmt.cancelling_lock();
+        // let stmt = unsafe { StatementConnection::new(stmt.into_sys(), self, cancelling_lock) };
+        // Ok(Prepared::new(stmt))
     }
 
     /// Allocates an SQL statement handle. This is recommended if you want to sequentially execute
