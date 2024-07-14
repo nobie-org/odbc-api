@@ -5,6 +5,7 @@ use super::{
     buffer::{clamp_small_int, mut_buf_ptr},
     SqlChar,
 };
+use log::info;
 use odbc_sys::{SqlReturn, SQLSTATE_SIZE};
 use std::fmt;
 
@@ -21,6 +22,8 @@ use odbc_sys::SQLGetDiagRec as sql_get_diag_rec;
 pub struct State(pub [u8; SQLSTATE_SIZE]);
 
 impl State {
+    /// When returned from the SQLCloseCursor function, no cursor was open on the StatementHandle. (This is returned only by an ODBC 3.x driver.)
+    pub const INVALID_CURSOR_STATE: State = State(*b"24000");
     /// Can be returned from SQLDisconnect
     pub const INVALID_STATE_TRANSACTION: State = State(*b"25000");
     /// Given the specified Attribute value, an invalid value was specified in ValuePtr.
@@ -200,6 +203,9 @@ impl<T: AsHandle + ?Sized> Diagnostics for T {
             native_error,
             text_length,
         };
+
+        info!("SQLGetDiagRec returned: {:?}", result);
+        info!("SQLGetDiagRec returned with code: {:?}", ret);
 
         match ret {
             SqlReturn::SUCCESS | SqlReturn::SUCCESS_WITH_INFO => Some(result),

@@ -19,6 +19,8 @@ mod sql_char;
 mod sql_result;
 mod statement;
 
+pub(crate) use connection::CancellingLock;
+
 pub use {
     as_handle::AsHandle,
     bind::{CData, CDataMut, DelayedInput, HasDataType},
@@ -31,10 +33,11 @@ pub use {
     logging::log_diagnostics,
     sql_char::{slice_to_cow_utf8, slice_to_utf8, OutputStringBuffer, SqlChar, SqlText, SzBuffer},
     sql_result::SqlResult,
+    statement::StatementCancelHandle,
     statement::{AsStatementRef, ParameterDescription, Statement, StatementImpl, StatementRef},
 };
 
-use log::debug;
+use log::{debug, info};
 use odbc_sys::{Handle, HandleType, SQLFreeHandle, SqlReturn};
 use std::thread::panicking;
 
@@ -45,6 +48,7 @@ use std::thread::panicking;
 ///
 /// `handle` Must be a valid ODBC handle and `handle_type` must match its type.
 pub unsafe fn drop_handle(handle: Handle, handle_type: HandleType) {
+    info!("Dropping handle {handle:?} of type {handle_type:?}.");
     match SQLFreeHandle(handle_type, handle) {
         SqlReturn::SUCCESS => {
             debug!("SQLFreeHandle dropped {handle:?} of type {handle_type:?}.");

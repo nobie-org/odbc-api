@@ -1,7 +1,9 @@
 use std::intrinsics::transmute;
 
+use log::info;
+
 use crate::{
-    handles::{AsStatementRef, SqlText, Statement},
+    handles::{AsStatementRef, SqlText, Statement, StatementCancelHandle},
     parameter::Blob,
     sleep::wait_for,
     CursorImpl, CursorPolling, Error, ParameterCollectionRef, Sleep,
@@ -97,6 +99,7 @@ where
         stmt.exec_direct(sql)
     } else {
         // We execute a prepared query
+        info!("Executing prepared query");
         stmt.execute()
     };
 
