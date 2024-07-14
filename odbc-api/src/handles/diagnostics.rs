@@ -21,6 +21,8 @@ use odbc_sys::SQLGetDiagRec as sql_get_diag_rec;
 pub struct State(pub [u8; SQLSTATE_SIZE]);
 
 impl State {
+    /// When returned from the SQLCloseCursor function, no cursor was open on the StatementHandle. (This is returned only by an ODBC 3.x driver.)
+    pub const INVALID_CURSOR_STATE: State = State(*b"24000");
     /// Can be returned from SQLDisconnect
     pub const INVALID_STATE_TRANSACTION: State = State(*b"25000");
     /// Given the specified Attribute value, an invalid value was specified in ValuePtr.

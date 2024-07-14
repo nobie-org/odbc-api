@@ -1,9 +1,12 @@
-use odbc_sys::HStmt;
+use odbc_sys::{HStmt, SQLCancel};
 
 use crate::{
     buffers::Indicator,
     error::ExtendResult,
-    handles::{AsStatementRef, CDataMut, SqlResult, State, Statement, StatementRef},
+    handles::{
+        AsStatementRef, CDataMut, CancellingLock, Record, SqlResult, State, Statement,
+        StatementCancelHandle, StatementRef,
+    },
     parameter::{Binary, CElement, Text, VarCell, VarKind, WideText},
     sleep::{wait_for, Sleep},
     Error, ResultSetMetadata,
@@ -286,6 +289,7 @@ impl<'s> CursorRow<'s> {
 pub struct CursorImpl<Stmt: AsStatementRef> {
     /// A statement handle in cursor mode.
     statement: Stmt,
+    cancelling_lock: CancellingLock,
 }
 
 impl<S> Drop for CursorImpl<S>
@@ -293,12 +297,27 @@ where
     S: AsStatementRef,
 {
     fn drop(&mut self) {
+        self.cancelling_lock.mark_as_dropped();
         let mut stmt = self.statement.as_stmt_ref();
         if let Err(e) = stmt.close_cursor().into_result(&stmt) {
-            // Avoid panicking, if we already have a panic. We don't want to mask the original
-            // error.
-            if !panicking() {
-                panic!("Unexpected error closing cursor: {e:?}")
+            match e {
+                Error::Diagnostics {
+                    record:
+                        Record {
+                            state: State::INVALID_CURSOR_STATE,
+                            ..
+                        },
+                    ..
+                } => {
+                    // do nothing
+                }
+                _ => {
+                    // Avoid panicking, if we already have a panic. We don't want to mask the original
+                    // error.
+                    if !panicking() {
+                        panic!("Unexpected error closing cursor: {e:?}")
+                    }
+                }
             }
         }
     }
@@ -340,7 +359,7 @@ where
 
         let has_another_result = unsafe { stmt.more_results() }.into_result_bool(&stmt)?;
         let next = if has_another_result {
-            Some(CursorImpl { statement })
+            Some(unsafe { CursorImpl::new(statement) })
         } else {
             None
         };
@@ -363,7 +382,10 @@ where
     ///
     /// `statement` must be in Cursor state, for the invariants of this type to hold.
     pub unsafe fn new(statement: S) -> Self {
-        Self { statement }
+        Self {
+            statement,
+            cancelling_lock: Default::default(),
+        }
     }
 
     /// Deconstructs the `CursorImpl` without calling drop. This is a way to get to the underlying
@@ -379,6 +401,12 @@ where
 
     pub(crate) fn as_sys(&mut self) -> HStmt {
         self.as_stmt_ref().as_sys()
+    }
+
+    pub fn cancel_handle(&mut self) -> StatementCancelHandle {
+        self.statement
+            .as_stmt_ref()
+            .cancel_handle(self.cancelling_lock.clone())
     }
 }
 

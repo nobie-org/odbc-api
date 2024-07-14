@@ -13,9 +13,10 @@ use super::{
 use log::debug;
 use odbc_sys::{
     CompletionType, ConnectionAttribute, DriverConnectOption, HDbc, HEnv, HStmt, HWnd, Handle,
-    HandleType, InfoType, Pointer, SQLAllocHandle, SQLDisconnect, SQLEndTran, IS_UINTEGER,
+    HandleType, InfoType, Pointer, SQLAllocHandle, SQLCancelHandle as sql_cancel_handle,
+    SQLDisconnect, SQLEndTran, IS_UINTEGER,
 };
-use std::{ffi::c_void, marker::PhantomData, mem::size_of, ptr::null_mut};
+use std::{ffi::c_void, marker::PhantomData, mem::size_of, ptr::null_mut, sync::Arc};
 
 #[cfg(feature = "narrow")]
 use odbc_sys::{
@@ -31,6 +32,28 @@ use odbc_sys::{
     SQLSetConnectAttrW as sql_set_connect_attr,
 };
 
+#[derive(Clone, Default)]
+pub(crate) struct CancellingLock {
+    lock: Arc<std::sync::Mutex<bool>>,
+}
+
+impl CancellingLock {
+    pub fn mark_as_dropped(&self) {
+        *self.lock.lock().unwrap() = true;
+    }
+
+    pub fn call_cancel(&self, cancel_fn: impl FnOnce() -> SqlResult<()>) -> SqlResult<()> {
+        let dropped = self.lock.lock().unwrap();
+        if *dropped {
+            SqlResult::Error {
+                function: "called cancel after connection was dropped",
+            }
+        } else {
+            cancel_fn()
+        }
+    }
+}
+
 /// The connection handle references storage of all information about the connection to the data
 /// source, including status, transaction state, and error information.
 ///
@@ -40,6 +63,7 @@ use odbc_sys::{
 pub struct Connection<'c> {
     parent: PhantomData<&'c HEnv>,
     handle: HDbc,
+    cancelling_lock: CancellingLock,
 }
 
 unsafe impl<'c> AsHandle for Connection<'c> {
@@ -60,6 +84,29 @@ impl<'c> Drop for Connection<'c> {
     }
 }
 
+pub struct ConnectionCancelHandle {
+    handle: HDbc,
+    cancelling_lock: CancellingLock,
+}
+
+impl ConnectionCancelHandle {
+    fn new(handle: HDbc, cancelling_lock: CancellingLock) -> Self {
+        Self {
+            handle,
+            cancelling_lock,
+        }
+    }
+
+    pub fn cancel(&self) -> SqlResult<()> {
+        self.cancelling_lock.call_cancel(|| unsafe {
+            sql_cancel_handle(HandleType::Dbc, self.handle as Handle)
+                .into_sql_result("SQLCancelHandle")
+        })
+    }
+}
+
+unsafe impl Send for ConnectionCancelHandle {}
+
 /// According to the ODBC documentation this is safe. See:
 /// <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/multithreading>
 ///
@@ -77,9 +124,14 @@ impl<'c> Connection<'c> {
     /// Call this method only with a valid (successfully allocated) ODBC connection handle.
     pub unsafe fn new(handle: HDbc) -> Self {
         Self {
+            cancelling_lock: Default::default(),
             handle,
             parent: PhantomData,
         }
+    }
+
+    pub(crate) fn set_dropped(&self) {
+        self.cancelling_lock.mark_as_dropped();
     }
 
     /// Directly acces the underlying ODBC handle.
@@ -119,6 +171,10 @@ impl<'c> Connection<'c> {
             )
             .into_sql_result("SQLConnect")
         }
+    }
+
+    pub fn cancel_handle(&self) -> ConnectionCancelHandle {
+        ConnectionCancelHandle::new(self.as_sys(), self.cancelling_lock.clone())
     }
 
     /// An alternative to `connect`. It supports data sources that require more connection

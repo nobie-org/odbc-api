@@ -19,11 +19,14 @@ mod sql_char;
 mod sql_result;
 mod statement;
 
+pub(crate) use connection::CancellingLock;
+
 pub use {
     as_handle::AsHandle,
     bind::{CData, CDataMut, DelayedInput, HasDataType},
     column_description::{ColumnDescription, Nullability},
     connection::Connection,
+    connection::ConnectionCancelHandle,
     data_type::DataType,
     descriptor::Descriptor,
     diagnostics::{Diagnostics, Record, State},
@@ -31,6 +34,7 @@ pub use {
     logging::log_diagnostics,
     sql_char::{slice_to_cow_utf8, slice_to_utf8, OutputStringBuffer, SqlChar, SqlText, SzBuffer},
     sql_result::SqlResult,
+    statement::StatementCancelHandle,
     statement::{AsStatementRef, ParameterDescription, Statement, StatementImpl, StatementRef},
 };
 

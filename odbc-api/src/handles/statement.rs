@@ -3,6 +3,7 @@ use super::{
     bind::{CDataMut, DelayedInput, HasDataType},
     buffer::{clamp_small_int, mut_buf_ptr},
     column_description::{ColumnDescription, Nullability},
+    connection::CancellingLock,
     data_type::DataType,
     drop_handle,
     sql_char::{binary_length, is_truncated_bin, resize_to_fit_without_tz},
@@ -12,9 +13,9 @@ use super::{
 use log::debug;
 use odbc_sys::{
     Desc, FreeStmtOption, HDbc, HStmt, Handle, HandleType, Len, ParamType, Pointer, SQLBindCol,
-    SQLBindParameter, SQLCloseCursor, SQLDescribeParam, SQLExecute, SQLFetch, SQLFreeStmt,
-    SQLGetData, SQLMoreResults, SQLNumParams, SQLNumResultCols, SQLParamData, SQLPutData,
-    SQLRowCount, SqlDataType, SqlReturn, StatementAttribute, IS_POINTER,
+    SQLBindParameter, SQLCancel, SQLCloseCursor, SQLDescribeParam, SQLExecute, SQLFetch,
+    SQLFreeStmt, SQLGetData, SQLMoreResults, SQLNumParams, SQLNumResultCols, SQLParamData,
+    SQLPutData, SQLRowCount, SqlDataType, SqlReturn, StatementAttribute, IS_POINTER,
 };
 use std::{ffi::c_void, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr::null_mut};
 
@@ -149,6 +150,21 @@ impl<'s> AsStatementRef for StatementRef<'s> {
     }
 }
 
+pub struct StatementCancelHandle {
+    statement_handle: HStmt,
+    cancelling_lock: CancellingLock,
+}
+
+impl StatementCancelHandle {
+    pub fn cancel(&self) -> SqlResult<()> {
+        self.cancelling_lock.call_cancel(|| unsafe {
+            SQLCancel(self.statement_handle).into_sql_result("SQLCancel")
+        })
+    }
+}
+
+unsafe impl Send for StatementCancelHandle {}
+
 /// An ODBC statement handle. In this crate it is implemented by [`self::StatementImpl`]. In ODBC
 /// Statements are used to execute statements and retrieve results. Both parameter and result
 /// buffers are bound to the statement and dereferenced during statement execution and fetching
@@ -189,6 +205,17 @@ pub trait Statement: AsHandle {
             target.mut_indicator_ptr(),
         )
         .into_sql_result("SQLBindCol")
+    }
+
+    fn cancel(&mut self) -> SqlResult<()> {
+        unsafe { SQLCancel(self.as_sys()) }.into_sql_result("SQLCancel")
+    }
+
+    fn cancel_handle(&mut self, cancelling_lock: CancellingLock) -> StatementCancelHandle {
+        StatementCancelHandle {
+            statement_handle: self.as_sys(),
+            cancelling_lock,
+        }
     }
 
     /// Returns the next row set in the result set.

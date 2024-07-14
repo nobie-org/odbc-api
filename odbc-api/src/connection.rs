@@ -4,11 +4,14 @@ use crate::{
         execute_columns, execute_foreign_keys, execute_tables, execute_with_parameters,
         execute_with_parameters_polling,
     },
-    handles::{self, slice_to_utf8, SqlText, State, Statement, StatementImpl},
+    handles::{
+        self, slice_to_utf8, ConnectionCancelHandle, SqlResult, SqlText, State, Statement,
+        StatementImpl,
+    },
     statement_connection::StatementConnection,
     CursorImpl, CursorPolling, Error, ParameterCollectionRef, Preallocated, Prepared, Sleep,
 };
-use odbc_sys::HDbc;
+use odbc_sys::{HDbc, Handle, HandleType, SQLCancelHandle as sql_cancel_handle};
 use std::{
     borrow::Cow,
     fmt::{self, Debug, Display},
@@ -19,6 +22,7 @@ use std::{
 
 impl<'conn> Drop for Connection<'conn> {
     fn drop(&mut self) {
+        self.connection.set_dropped();
         match self.connection.disconnect().into_result(&self.connection) {
             Ok(()) => (),
             Err(Error::Diagnostics {
@@ -85,6 +89,10 @@ impl<'c> Connection<'c> {
     /// to rigid for you, while simultaneously abondoning its safeguards.
     pub fn into_handle(self) -> handles::Connection<'c> {
         unsafe { handles::Connection::new(ManuallyDrop::new(self).connection.as_sys()) }
+    }
+
+    pub fn cancel_handle(&self) -> ConnectionCancelHandle {
+        self.connection.cancel_handle()
     }
 
     /// Executes an SQL statement. This is the fastest way to submit an SQL statement for one-time
