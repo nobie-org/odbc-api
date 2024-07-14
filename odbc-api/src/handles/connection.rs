@@ -10,6 +10,7 @@ use super::{
     statement::StatementImpl,
     OutputStringBuffer, SqlResult,
 };
+use core::sync;
 use log::{debug, info};
 use odbc_sys::{
     CompletionType, ConnectionAttribute, DriverConnectOption, HDbc, HEnv, HStmt, HWnd, Handle,
@@ -21,7 +22,7 @@ use std::{
     marker::PhantomData,
     mem::size_of,
     ptr::null_mut,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Condvar},
 };
 
 #[cfg(feature = "narrow")]
@@ -46,11 +47,9 @@ enum StatementState {
     CancelableOperationInProgress,
 }
 
-#[derive(Default)]
 struct CancelLockState {
     dropped: AtomicBool,
-    cancelable_operation_in_progress: AtomicBool,
-    cancelled: AtomicBool,
+    cancelable_operation_in_progress: CancelableOpInProgress,
 }
 
 impl CancelLockState {
@@ -60,14 +59,12 @@ impl CancelLockState {
     }
 
     fn set_statement_state(&self, state: StatementState) {
+        let ptr = self.cancelable_operation_in_progress.as_ptr();
+        info!("cancelable operation in progress {:?}", ptr);
         match state {
-            StatementState::Idle => {
-                self.cancelable_operation_in_progress
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
+            StatementState::Idle => self.cancelable_operation_in_progress.set_finished(),
             StatementState::CancelableOperationInProgress => {
-                self.cancelable_operation_in_progress
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.cancelable_operation_in_progress.set_started();
             }
             StatementState::Dropped => {
                 self.set_dropped();
@@ -78,13 +75,73 @@ impl CancelLockState {
     fn statement_state(&self) -> StatementState {
         if self.dropped.load(std::sync::atomic::Ordering::Relaxed) {
             StatementState::Dropped
-        } else if self
-            .cancelable_operation_in_progress
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        } else if self.cancelable_operation_in_progress.is_in_progress() {
             StatementState::CancelableOperationInProgress
         } else {
             StatementState::Idle
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CancelableOpInProgress(Arc<(Condvar, std::sync::Mutex<bool>)>);
+
+impl CancelableOpInProgress {
+    fn new() -> Self {
+        Self(Arc::new((Condvar::new(), std::sync::Mutex::new(false))))
+    }
+
+    pub fn as_ptr(&self) -> *const (Condvar, std::sync::Mutex<bool>) {
+        Arc::as_ptr(&self.0)
+    }
+
+    fn set_started(&self) {
+        let (condvar, mutex) = &*self.0;
+        let mut guard = mutex.lock().unwrap();
+        *guard = true;
+        info!("notifying all");
+        condvar.notify_all();
+    }
+
+    fn set_finished(&self) {
+        let (condvar, mutex) = &*self.0;
+        let mut guard = mutex.lock().unwrap();
+        *guard = false;
+        condvar.notify_all();
+    }
+
+    pub fn is_in_progress(&self) -> bool {
+        let (_, mutex) = &*self.0;
+        let guard = mutex.lock().unwrap();
+        *guard
+    }
+
+    pub fn wait_for_start_with_timeout(&self, timeout: std::time::Duration) -> (bool, bool) {
+        let (condvar, mutex) = &*self.0;
+        let ongoing = mutex.lock().unwrap();
+        let (has_started, timeout_result) = condvar
+            // wait while not ongoing
+            .wait_timeout_while(ongoing, timeout, |ongoing| !*ongoing)
+            .unwrap();
+
+        (*has_started, timeout_result.timed_out())
+    }
+
+    pub fn wait_for_start(&self) {
+        let (condvar, mutex) = &*self.0;
+        let mut ongoing = mutex.lock().unwrap();
+        // wait while not ongoing
+        while !*ongoing {
+            ongoing = condvar.wait(ongoing).unwrap();
+        }
+    }
+
+    pub fn wait_for_finish(&self) {
+        let (condvar, mutex) = &*self.0;
+        let mut ongoing = mutex.lock().unwrap();
+        // wait while ongoing
+        while *ongoing {
+            ongoing = condvar.wait(ongoing).unwrap();
         }
     }
 }
@@ -105,7 +162,10 @@ impl CancellingLock {
     pub(crate) fn new() -> Self {
         info!("Creating new CancellingLock.");
         Self {
-            inner: Default::default(),
+            inner: Arc::new(CancelLockState {
+                dropped: AtomicBool::new(false),
+                cancelable_operation_in_progress: CancelableOpInProgress::new(),
+            }),
         }
     }
 
@@ -130,13 +190,13 @@ impl CancellingLock {
         result
     }
 
-    pub(crate) fn cancelable_operation_started(&self) {
+    fn cancelable_operation_started(&self) {
         assert!(matches!(self.inner.statement_state(), StatementState::Idle));
         self.inner
             .set_statement_state(StatementState::CancelableOperationInProgress);
     }
 
-    pub(crate) fn cancelable_operation_finished(&self) {
+    fn cancelable_operation_finished(&self) {
         assert!(matches!(
             self.inner.statement_state(),
             StatementState::CancelableOperationInProgress
@@ -144,25 +204,16 @@ impl CancellingLock {
         self.inner.set_statement_state(StatementState::Idle);
     }
 
+    pub(crate) fn notifier(&self) -> CancelableOpInProgress {
+        self.inner.cancelable_operation_in_progress.clone()
+    }
+
     pub(crate) fn call_cancel(&self, cancel_fn: impl FnOnce() -> SqlResult<()>) -> SqlResult<()> {
         match &self.inner.statement_state() {
             StatementState::Dropped => SqlResult::Error {
                 function: "called cancel after connection was dropped",
             },
-            StatementState::CancelableOperationInProgress => {
-                if self
-                    .inner
-                    .cancelled
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    // info!("Cancel was already called. No need to call it again.");
-                    // return SqlResult::Success(());
-                }
-                self.inner
-                    .cancelled
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                cancel_fn()
-            }
+            StatementState::CancelableOperationInProgress => cancel_fn(),
             StatementState::Idle => {
                 info!("Cancel statment ws not in progress. No need to cancel.");
                 SqlResult::Success(())

@@ -3,7 +3,7 @@ use super::{
     bind::{CDataMut, DelayedInput, HasDataType},
     buffer::{clamp_small_int, mut_buf_ptr},
     column_description::{ColumnDescription, Nullability},
-    connection::CancellingLock,
+    connection::{CancelableOpInProgress, CancellingLock},
     data_type::DataType,
     drop_handle,
     sql_char::{binary_length, is_truncated_bin, resize_to_fit_without_tz},
@@ -177,9 +177,9 @@ pub struct StatementCancelHandle {
 }
 
 impl StatementCancelHandle {
-    // pub(crate) fn inner_lock(&self) -> CancellingLock {
-    //     self.cancelling_lock.clone()
-    // }
+    pub fn notifier(&self) -> Option<CancelableOpInProgress> {
+        self.cancelling_lock.upgrade().map(|lock| lock.notifier())
+    }
 
     pub fn cancel(&self) -> SqlResult<()> {
         if let Some(cancelling_lock) = self.cancelling_lock.upgrade() {
