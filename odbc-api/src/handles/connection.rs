@@ -59,8 +59,6 @@ impl CancelLockState {
     }
 
     fn set_statement_state(&self, state: StatementState) {
-        let ptr = self.cancelable_operation_in_progress.as_ptr();
-        info!("cancelable operation in progress {:?}", ptr);
         match state {
             StatementState::Idle => self.cancelable_operation_in_progress.set_finished(),
             StatementState::CancelableOperationInProgress => {
@@ -99,7 +97,7 @@ impl CancelableOpInProgress {
         let (condvar, mutex) = &*self.0;
         let mut guard = mutex.lock().unwrap();
         *guard = true;
-        info!("notifying all");
+        info!("notifying all that cancelable operation started.");
         condvar.notify_all();
     }
 
@@ -107,6 +105,7 @@ impl CancelableOpInProgress {
         let (condvar, mutex) = &*self.0;
         let mut guard = mutex.lock().unwrap();
         *guard = false;
+        info!("notifying all that cancelable operation finished.");
         condvar.notify_all();
     }
 
