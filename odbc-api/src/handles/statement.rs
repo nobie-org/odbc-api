@@ -206,6 +206,7 @@ impl StatementCancelHandle {
 }
 
 unsafe impl Send for StatementCancelHandle {}
+unsafe impl Sync for StatementCancelHandle {}
 
 /// An ODBC statement handle. In this crate it is implemented by [`self::StatementImpl`]. In ODBC
 /// Statements are used to execute statements and retrieve results. Both parameter and result
