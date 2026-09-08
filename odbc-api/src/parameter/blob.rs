@@ -1,8 +1,8 @@
-use odbc_sys::{len_data_at_exec, CDataType, DATA_AT_EXEC};
+use odbc_sys::{CDataType, DATA_AT_EXEC, len_data_at_exec};
 
 use crate::{
-    handles::{DelayedInput, HasDataType, Statement},
     DataType, Error, ParameterCollection, ParameterTupleElement,
+    handles::{DelayedInput, HasDataType, Statement},
 };
 use std::{
     ffi::c_void,
@@ -12,14 +12,14 @@ use std::{
     path::Path,
 };
 
-/// A `Blob` can stream its contents to the database batch by batch and may therefore be used to
+/// A [`Blob`] can stream its contents to the database batch by batch and may therefore be used to
 /// transfer large amounts of data, exceeding the drivers capabilities for normal input parameters.
 ///
 /// # Safety
 ///
 /// If a hint is implemented for `blob_size` it must be accurate before the first call to
 /// `next_batch`.
-pub unsafe trait Blob: HasDataType {
+pub unsafe trait Blob: HasDataType + Send {
     /// CData type of the binary data returned in the batches. Likely to be either
     /// [`crate::sys::CDataType::Binary`], [`crate::sys::CDataType::Char`] or
     /// [`crate::sys::CDataType::WChar`].
@@ -36,7 +36,7 @@ pub unsafe trait Blob: HasDataType {
     fn next_batch(&mut self) -> io::Result<Option<&[u8]>>;
 
     /// Convinience function. Same as calling [`self::BlobParam::new`].
-    fn as_blob_param(&mut self) -> BlobParam
+    fn as_blob_param(&mut self) -> BlobParam<'_>
     where
         Self: Sized,
     {
@@ -96,7 +96,7 @@ unsafe impl ParameterCollection for BlobParam<'_> {
     }
 
     unsafe fn bind_parameters_to(&mut self, stmt: &mut impl Statement) -> Result<(), Error> {
-        stmt.bind_delayed_input_parameter(1, self).into_result(stmt)
+        unsafe { stmt.bind_delayed_input_parameter(1, self) }.into_result(stmt)
     }
 }
 
@@ -106,8 +106,7 @@ unsafe impl ParameterTupleElement for &mut BlobParam<'_> {
         parameter_number: u16,
         stmt: &mut impl Statement,
     ) -> Result<(), Error> {
-        stmt.bind_delayed_input_parameter(parameter_number, *self)
-            .into_result(stmt)
+        unsafe { stmt.bind_delayed_input_parameter(parameter_number, *self) }.into_result(stmt)
     }
 }
 
@@ -144,7 +143,7 @@ impl<'a> BlobSlice<'a> {
     ///
     ///     let insert = "INSERT INTO Images (id, image_data) VALUES (?,?)";
     ///     let parameters = (&id.into_parameter(), &mut blob.as_blob_param());
-    ///     conn.execute(&insert, parameters)?;
+    ///     conn.execute(&insert, parameters, None)?;
     ///     Ok(())
     /// }
     /// ```
@@ -178,7 +177,7 @@ impl<'a> BlobSlice<'a> {
     ///
     ///     let insert = "INSERT INTO Books (title, text) VALUES (?,?)";
     ///     let parameters = (&title.into_parameter(), &mut blob.as_blob_param());
-    ///     conn.execute(&insert, parameters)?;
+    ///     conn.execute(&insert, parameters, None)?;
     ///     Ok(())
     /// }
     /// ```
@@ -240,9 +239,9 @@ unsafe impl Blob for BlobSlice<'_> {
 /// Buffer of the [`std::io::BufRead`] implementation, so the batch size is likely equal to that
 /// capacity.
 pub struct BlobRead<R> {
-    /// `true` if `size` is to interpreted as the exact ammount of bytes contained in the reader, at
-    /// the time of binding it as a parameter. `false` if `size` is to be interpreted as an upper
-    /// bound.
+    /// `true` if `size` is to interpreted as the exact ammount of bytes contained in the reader,
+    /// at the time of binding it as a parameter. `false` if `size` is to be interpreted as an
+    /// upper bound.
     exact: bool,
     size: usize,
     consume: usize,
@@ -267,14 +266,15 @@ impl<R> BlobRead<R> {
     /// fn insert_image_to_db(
     ///     conn: &Connection<'_>,
     ///     id: &str,
-    ///     image_data: impl BufRead) -> Result<(), Error>
+    ///     image_data: impl BufRead + Send) -> Result<(), Error>
     /// {
     ///     const MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
     ///     let mut blob = BlobRead::with_upper_bound(image_data, MAX_IMAGE_SIZE);
     ///
     ///     let sql = "INSERT INTO Images (id, image_data) VALUES (?, ?)";
     ///     let parameters = (&id.into_parameter(), &mut blob.as_blob_param());
-    ///     conn.execute(sql, parameters)?;
+    ///     let timeout_sec = None;
+    ///     conn.execute(sql, parameters, timeout_sec)?;
     ///     Ok(())
     /// }
     /// ```
@@ -329,7 +329,8 @@ impl BlobRead<BufReader<File>> {
     ///
     ///     let sql = "INSERT INTO Images (id, image_data) VALUES (?, ?)";
     ///     let parameters = (&id.into_parameter(), &mut blob.as_blob_param());
-    ///     conn.execute(sql, parameters)?;
+    ///     let timeout_sec = None;
+    ///     conn.execute(sql, parameters, timeout_sec)?;
     ///     Ok(())
     /// }
     /// ```
@@ -359,18 +360,14 @@ where
 
 unsafe impl<R> Blob for BlobRead<R>
 where
-    R: BufRead,
+    R: BufRead + Send,
 {
     fn c_data_type(&self) -> CDataType {
         CDataType::Binary
     }
 
     fn size_hint(&self) -> Option<usize> {
-        if self.exact {
-            Some(self.size)
-        } else {
-            None
-        }
+        if self.exact { Some(self.size) } else { None }
     }
 
     fn next_batch(&mut self) -> io::Result<Option<&[u8]>> {

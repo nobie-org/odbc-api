@@ -1,37 +1,42 @@
 use crate::{
+    DataType, Error,
+    buffers::{Resize, columnar::Slice},
     columnar_bulk_inserter::BoundInputSlice,
     error::TooLargeBufferSize,
-    handles::{CData, CDataMut, HasDataType, Statement, StatementRef},
-    DataType, Error,
+    handles::{
+        ASSUMED_MAX_LENGTH_OF_VARCHAR, ASSUMED_MAX_LENGTH_OF_W_VARCHAR, CData, CDataMut,
+        HasDataType, Statement, StatementRef,
+    },
 };
 
 use super::{ColumnBuffer, Indicator};
 
-use log::debug;
+use log::trace;
 use odbc_sys::{CDataType, NULL_DATA};
-use std::{cmp::min, ffi::c_void, mem::size_of, num::NonZeroUsize, panic};
-use widestring::U16Str;
+use std::{any::Any, cmp::min, ffi::c_void, mem::size_of, num::NonZeroUsize, panic};
+use widestring::Utf16Str;
 
 /// A column buffer for character data. The actual encoding used may depend on your system locale.
 pub type CharColumn = TextColumn<u8>;
 
 /// This buffer uses wide characters which implies UTF-16 encoding. UTF-8 encoding is preferable for
-/// most applications, but contrary to its sibling [`crate::buffers::CharColumn`] this buffer types
+/// most applications, but contrary to its sibling [`crate::buffers::CharColumn`] this buffer type's
 /// implied encoding does not depend on the system locale.
 pub type WCharColumn = TextColumn<u16>;
 
 /// A buffer intended to be bound to a column of a cursor. Elements of the buffer will contain a
 /// variable amount of characters up to a maximum string length. Since most SQL types have a string
 /// representation this buffer can be bound to a column of almost any type, ODBC driver and driver
-/// manager should take care of the conversion. Since elements of this type have variable length an
-/// indicator buffer needs to be bound, whether the column is nullable or not, and therefore does
-/// not matter for this buffer.
+/// manager should take care of the conversion. Since elements of this type have variable length, an
+/// indicator buffer needs to be bound, whether the column is nullable or not.
 ///
 /// Character type `C` is intended to be either `u8` or `u16`.
 #[derive(Debug)]
 pub struct TextColumn<C> {
     /// Maximum text length without terminating zero.
     max_str_len: usize,
+    /// All the characters of all the elements in the buffer. The first character of the n-th
+    /// element is at index `n * (max_str_len + 1)`.
     values: Vec<C>,
     /// Elements in this buffer are either `NULL_DATA` or hold the length of the element in value
     /// with the same index. Please note that this value may be larger than `max_str_len` if the
@@ -172,9 +177,18 @@ impl<C> TextColumn<C> {
     where
         C: Default + Copy,
     {
-        debug!(
+        #[cfg(not(feature = "structured_logging"))]
+        trace!(
             "Rebinding text column buffer with {} elements. Maximum string length {} => {}",
             num_rows, self.max_str_len, new_max_str_len
+        );
+        #[cfg(feature = "structured_logging")]
+        trace!(
+            target: "odbc_api",
+            num_rows = num_rows,
+            old_max_str_len = self.max_str_len,
+            new_max_str_len = new_max_str_len;
+            "Text column buffer resized"
         );
 
         let batch_size = self.indicators.len();
@@ -297,8 +311,8 @@ impl<C> TextColumn<C> {
 }
 
 impl WCharColumn {
-    /// The string slice at the specified position as `U16Str`. Includes interior nuls, but excludes
-    /// the terminating nul.
+    /// The string slice at the specified position as `Utf16Str`. Includes interior nuls, but
+    /// excludes the terminating nul.
     ///
     /// # Safety
     ///
@@ -306,28 +320,18 @@ impl WCharColumn {
     /// can not guarantee the accessed element to be valid and in a defined state. It also can not
     /// panic on accessing an undefined element. It will panic however if `row_index` is larger or
     /// equal to the maximum number of elements in the buffer.
-    pub unsafe fn ustr_at(&self, row_index: usize) -> Option<&U16Str> {
-        self.value_at(row_index).map(U16Str::from_slice)
+    pub unsafe fn utf16_str_at(&self, row_index: usize) -> Option<&Utf16Str> {
+        self.value_at(row_index)
+            .map(Utf16Str::from_slice)
+            .transpose()
+            .expect("Wide character encoding must be UTF-16")
     }
 }
 
-unsafe impl<C: 'static> ColumnBuffer for TextColumn<C>
+unsafe impl<C> ColumnBuffer for TextColumn<C>
 where
-    TextColumn<C>: CDataMut + HasDataType,
+    TextColumn<C>: CDataMut + HasDataType + Any,
 {
-    type View<'a> = TextColumnView<'a, C>;
-
-    fn view(&self, valid_rows: usize) -> TextColumnView<'_, C> {
-        TextColumnView {
-            num_rows: valid_rows,
-            col: self,
-        }
-    }
-
-    fn fill_default(&mut self, from: usize, to: usize) {
-        self.fill_null(from, to)
-    }
-
     /// Maximum number of text strings this column may hold.
     fn capacity(&self) -> usize {
         self.indicators.len()
@@ -346,21 +350,32 @@ where
     }
 }
 
-/// Allows read only access to the valid part of a text column.
+unsafe impl<C: 'static> Slice for TextColumn<C> {
+    type Slice<'a> = TextColumnSlice<'a, C>;
+
+    fn slice(&self, valid_rows: usize) -> TextColumnSlice<'_, C> {
+        TextColumnSlice {
+            num_rows: valid_rows,
+            col: self,
+        }
+    }
+}
+
+/// Allows read-only access to the valid part of a text column.
 ///
 /// You may ask, why is this type required, should we not just be able to use `&TextColumn`? The
 /// problem with `TextColumn` is, that it is a buffer, but it has no idea how many of its members
-/// are actually valid, and have been returned with the last row group of the the result set. That
+/// are actually valid, and have been returned with the last row group of the result set. That
 /// number is maintained on the level of the entire column buffer. So a text column knows the number
 /// of valid rows, in addition to holding a reference to the buffer, in order to guarantee, that
-/// every element acccessed through it, is valid.
+/// every element accessed through it, is valid.
 #[derive(Debug, Clone, Copy)]
-pub struct TextColumnView<'c, C> {
+pub struct TextColumnSlice<'c, C> {
     num_rows: usize,
     col: &'c TextColumn<C>,
 }
 
-impl<'c, C> TextColumnView<'c, C> {
+impl<'c, C> TextColumnSlice<'c, C> {
     /// The number of valid elements in the text column.
     pub fn len(&self) -> usize {
         self.num_rows
@@ -371,7 +386,9 @@ impl<'c, C> TextColumnView<'c, C> {
         self.num_rows == 0
     }
 
-    /// Slice of text at the specified row index without terminating zero.
+    /// Slice of text at the specified row index without terminating zero. `None` if the value is
+    /// `NULL`. This method will panic if the index is larger than the number of valid rows in the
+    /// view as returned by [`Self::len`].
     pub fn get(&self, index: usize) -> Option<&'c [C]> {
         self.col.value_at(index)
     }
@@ -447,9 +464,9 @@ pub struct TextColumnSliceMut<'a, C> {
     parameter_index: u16,
 }
 
-impl<'a, C> TextColumnSliceMut<'a, C>
+impl<C> TextColumnSliceMut<'_, C>
 where
-    C: Default + Copy,
+    C: Default + Copy + Send,
 {
     /// Sets the value of the buffer at index at Null or the specified binary Text. This method will
     /// panic on out of bounds index, or if input holds a text which is larger than the maximum
@@ -460,7 +477,7 @@ where
 
     /// Ensures that the buffer is large enough to hold elements of `element_length`. Does nothing
     /// if the buffer is already large enough. Otherwise it will reallocate and rebind the buffer.
-    /// The first `num_rows_to_copy_elements` will be copied from the old value buffer to the new
+    /// The first `num_rows_to_copy` will be copied from the old value buffer to the new
     /// one. This makes this an extremely expensive operation.
     pub fn ensure_max_element_length(
         &mut self,
@@ -553,13 +570,17 @@ impl<'c> Iterator for TextColumnIt<'c, u8> {
     }
 }
 
-impl<'c> ExactSizeIterator for TextColumnIt<'c, u8> {}
+impl ExactSizeIterator for TextColumnIt<'_, u8> {}
 
 impl<'c> Iterator for TextColumnIt<'c, u16> {
-    type Item = Option<&'c U16Str>;
+    type Item = Option<&'c Utf16Str>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_impl().map(|opt| opt.map(U16Str::from_slice))
+    fn next(&mut self) -> Option<Option<&'c Utf16Str>> {
+        self.next_impl().map(|opt| {
+            opt.map(Utf16Str::from_slice)
+                .transpose()
+                .expect("Wide character encoding must be UTF-16")
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -568,7 +589,7 @@ impl<'c> Iterator for TextColumnIt<'c, u16> {
     }
 }
 
-impl<'c> ExactSizeIterator for TextColumnIt<'c, u16> {}
+impl ExactSizeIterator for TextColumnIt<'_, u16> {}
 
 unsafe impl CData for CharColumn {
     fn cdata_type(&self) -> CDataType {
@@ -600,8 +621,14 @@ unsafe impl CDataMut for CharColumn {
 
 impl HasDataType for CharColumn {
     fn data_type(&self) -> DataType {
-        DataType::Varchar {
-            length: NonZeroUsize::new(self.max_str_len),
+        if self.max_str_len <= ASSUMED_MAX_LENGTH_OF_VARCHAR {
+            DataType::Varchar {
+                length: NonZeroUsize::new(self.max_str_len),
+            }
+        } else {
+            DataType::LongVarchar {
+                length: NonZeroUsize::new(self.max_str_len),
+            }
         }
     }
 }
@@ -636,8 +663,46 @@ unsafe impl CDataMut for WCharColumn {
 
 impl HasDataType for WCharColumn {
     fn data_type(&self) -> DataType {
-        DataType::WVarchar {
-            length: NonZeroUsize::new(self.max_str_len),
+        if self.max_str_len <= ASSUMED_MAX_LENGTH_OF_W_VARCHAR {
+            DataType::WVarchar {
+                length: NonZeroUsize::new(self.max_str_len),
+            }
+        } else {
+            DataType::WLongVarchar {
+                length: NonZeroUsize::new(self.max_str_len),
+            }
         }
+    }
+}
+
+impl<C> Resize for TextColumn<C>
+where
+    C: Clone + Default,
+{
+    fn resize(&mut self, new_capacity: usize) {
+        self.values
+            .resize((self.max_str_len + 1) * new_capacity, C::default());
+        self.indicators.resize(new_capacity, NULL_DATA);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::buffers::{Resize, TextColumn};
+
+    #[test]
+    fn resize_text_column_buffer() {
+        // Given a text column buffer with two elements
+        let mut col = TextColumn::<u8>::new(2, 10);
+        col.set_value(0, Some(b"Hello"));
+        col.set_value(1, Some(b"World"));
+
+        // When we resize it to hold 3 elements
+        col.resize(3);
+
+        // Then the first two elements are still there, and the third is None
+        assert_eq!(col.value_at(0), Some(b"Hello".as_ref()));
+        assert_eq!(col.value_at(1), Some(b"World".as_ref()));
+        assert_eq!(col.value_at(2), None);
     }
 }

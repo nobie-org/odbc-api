@@ -1,23 +1,31 @@
 use std::mem::size_of;
 
-use odbc_sys::{Date, Time, Timestamp};
+use odbc_sys::{Date, Numeric, Time, Timestamp};
 
-use crate::{Bit, DataType};
+use crate::{Bit, DataType, TooLargeBufferSize};
+
+use super::{
+    BinColumn, BoxColumnBuffer, TextColumn,
+    column_with_indicator::{
+        OptBitColumn, OptDateColumn, OptF32Column, OptF64Column, OptI8Column, OptI16Column,
+        OptI32Column, OptI64Column, OptTimeColumn, OptTimestampColumn, OptU8Column,
+    },
+};
 
 /// Describes a column of a [`crate::buffers::ColumnarBuffer`].
 ///
-/// While related to to the [`crate::DataType`] of the column this is bound to, the Buffer type is
+/// While related to the [`crate::DataType`] of the column this is bound to, the Buffer type is
 /// different as it does not describe the type of the data source but the format the data is going
-/// to be represented in memory. While the data source is often considered to choose the buffer type
-/// the kind of processing which is supposed to be applied to the data may be even more important
-/// if choosing the a buffer for the cursor type. E.g. if you intend to print a date to standard out
-/// it may be more reasonable to bind it as `Text` rather than `Date`.
+/// to be represented in memory. While the data source is often considered to choose the buffer
+/// type, the kind of processing which is supposed to be applied to the data may be even more
+/// important when choosing a buffer for the cursor type. E.g. if you intend to print a date to
+/// standard output, it may be more reasonable to bind it as `Text` rather than `Date`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferDesc {
-    /// Variable sized binary buffer, holding up to `length` bytes per value.
+    /// Variable sized binary buffer, holding up to `max_bytes` bytes per value.
     Binary {
         /// Maximum number of bytes per value.
-        length: usize,
+        max_bytes: usize,
     },
     /// Text buffer holding strings with binary length of up to `max_str_len`.
     ///
@@ -44,70 +52,83 @@ pub enum BufferDesc {
     },
     /// 64 bit floating point
     F64 {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// 32 bit floating point
     F32 {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Describes a buffer holding [`crate::sys::Date`] values.
     Date {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Describes a buffer holding [`crate::sys::Time`] values.
     Time {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Describes a buffer holding [`crate::sys::Timestamp`] values.
     Timestamp {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Signed 8 Bit integer
     I8 {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Signed 16 Bit integer
     I16 {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Signed 32 Bit integer
     I32 {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Signed 64 Bit integer
     I64 {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Unsigned 8 Bit integer
     U8 {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
     /// Can either be zero or one
     Bit {
-        /// This indicates whether or not the buffer will be able to represent NULL values. This will
-        /// cause an indicator buffer to be bound.
+        /// This indicates whether or not the buffer will be able to represent NULL values. This
+        /// will cause an indicator buffer to be bound.
         nullable: bool,
     },
+    /// Use [`crate::sys::Numeric`] to represent Numeric values. Note that not all driver support
+    /// Numeric types. Even if they do, they may not respect the `scale` and `precision` values
+    /// unless they are explicit set in the Applicatior Parameter Descriptor (APD) for inserting or
+    /// the Application Row Descriptor (ARD). This currently would require unsafe code. Using text
+    /// buffers to insert or fetch Numeric values works more reliable.
+    ///
+    /// In my tests so far using Numeric buffers with PostgreSQL works for both inserting and
+    /// fetching values. With Microsoft SQL Server, it defaults to scale `0` and can not even be
+    /// changed by manipulating the ARD / APD via unsafe code for insertion.
+    ///
+    /// With MariaDB inserting works out of the box, yet fetching does default to scale `0` and
+    /// would require manipulating the ARD.
+    Numeric,
 }
 
 impl BufferDesc {
@@ -131,12 +152,13 @@ impl BufferDesc {
             DataType::Bit => BufferDesc::Bit { nullable },
             DataType::Varbinary { length }
             | DataType::Binary { length  }
-            | DataType::LongVarbinary { length } => length.map(|l| BufferDesc::Binary { length: l.get() })?,
+            | DataType::LongVarbinary { length } => length.map(|l| BufferDesc::Binary { max_bytes: l.get() })?,
             DataType::Varchar { length }
             | DataType::WVarchar { length }
             // Currently no special buffers for fixed lengths text implemented.
             | DataType::WChar {length }
             | DataType::Char { length }
+            | DataType::WLongVarchar { length }
             | DataType::LongVarchar { length } => {
                 length.map(|length| BufferDesc::Text { max_str_len : length.get() } )?
             },
@@ -156,7 +178,7 @@ impl BufferDesc {
     pub fn bytes_per_row(&self) -> usize {
         let size_indicator = |nullable: bool| if nullable { size_of::<isize>() } else { 0 };
         match *self {
-            BufferDesc::Binary { length } => length + size_indicator(true),
+            BufferDesc::Binary { max_bytes: length } => length + size_indicator(true),
             BufferDesc::Text { max_str_len } => max_str_len + 1 + size_indicator(true),
             BufferDesc::WText { max_str_len } => (max_str_len + 1) * 2 + size_indicator(true),
             BufferDesc::F64 { nullable } => size_of::<f64>() + size_indicator(nullable),
@@ -170,7 +192,74 @@ impl BufferDesc {
             BufferDesc::I64 { nullable } => size_of::<i64>() + size_indicator(nullable),
             BufferDesc::U8 { nullable } => size_of::<u8>() + size_indicator(nullable),
             BufferDesc::Bit { nullable } => size_of::<Bit>() + size_indicator(nullable),
+            BufferDesc::Numeric => size_of::<Numeric>(),
         }
+    }
+
+    /// Allocate a buffer matching the buffer description.
+    pub fn column_buffer(self, capacity: usize) -> BoxColumnBuffer {
+        self.impl_column_buffer(capacity, false).unwrap()
+    }
+
+    /// Allocate a buffer matching the buffer description using a fallible allocation.
+    pub fn try_column_buffer(self, capacity: usize) -> Result<BoxColumnBuffer, TooLargeBufferSize> {
+        self.impl_column_buffer(capacity, true)
+    }
+
+    fn impl_column_buffer(
+        self,
+        capacity: usize,
+        fallible: bool,
+    ) -> Result<BoxColumnBuffer, TooLargeBufferSize> {
+        let buffer: BoxColumnBuffer = match self {
+            BufferDesc::Binary { max_bytes } => {
+                if fallible {
+                    Box::new(BinColumn::try_new(capacity, max_bytes)?)
+                } else {
+                    Box::new(BinColumn::new(capacity, max_bytes))
+                }
+            }
+            BufferDesc::Text { max_str_len } => {
+                if fallible {
+                    Box::new(TextColumn::<u8>::try_new(capacity, max_str_len)?)
+                } else {
+                    Box::new(TextColumn::<u8>::new(capacity, max_str_len))
+                }
+            }
+            BufferDesc::WText { max_str_len } => {
+                if fallible {
+                    Box::new(TextColumn::<u16>::try_new(capacity, max_str_len)?)
+                } else {
+                    Box::new(TextColumn::<u16>::new(capacity, max_str_len))
+                }
+            }
+            BufferDesc::F64 { nullable: false } => Box::new(vec![f64::default(); capacity]),
+            BufferDesc::F64 { nullable: true } => Box::new(OptF64Column::new(capacity)),
+            BufferDesc::F32 { nullable: false } => Box::new(vec![f32::default(); capacity]),
+            BufferDesc::F32 { nullable: true } => Box::new(OptF32Column::new(capacity)),
+            BufferDesc::Date { nullable: false } => Box::new(vec![Date::default(); capacity]),
+            BufferDesc::Date { nullable: true } => Box::new(OptDateColumn::new(capacity)),
+            BufferDesc::Time { nullable: false } => Box::new(vec![Time::default(); capacity]),
+            BufferDesc::Time { nullable: true } => Box::new(OptTimeColumn::new(capacity)),
+            BufferDesc::Timestamp { nullable: false } => {
+                Box::new(vec![Timestamp::default(); capacity])
+            }
+            BufferDesc::Timestamp { nullable: true } => Box::new(OptTimestampColumn::new(capacity)),
+            BufferDesc::I8 { nullable: false } => Box::new(vec![i8::default(); capacity]),
+            BufferDesc::I8 { nullable: true } => Box::new(OptI8Column::new(capacity)),
+            BufferDesc::I16 { nullable: false } => Box::new(vec![i16::default(); capacity]),
+            BufferDesc::I16 { nullable: true } => Box::new(OptI16Column::new(capacity)),
+            BufferDesc::I32 { nullable: false } => Box::new(vec![i32::default(); capacity]),
+            BufferDesc::I32 { nullable: true } => Box::new(OptI32Column::new(capacity)),
+            BufferDesc::I64 { nullable: false } => Box::new(vec![i64::default(); capacity]),
+            BufferDesc::I64 { nullable: true } => Box::new(OptI64Column::new(capacity)),
+            BufferDesc::U8 { nullable: false } => Box::new(vec![u8::default(); capacity]),
+            BufferDesc::U8 { nullable: true } => Box::new(OptU8Column::new(capacity)),
+            BufferDesc::Bit { nullable: false } => Box::new(vec![Bit::default(); capacity]),
+            BufferDesc::Bit { nullable: true } => Box::new(OptBitColumn::new(capacity)),
+            BufferDesc::Numeric => Box::new(vec![Numeric::default(); capacity]),
+        };
+        Ok(buffer)
     }
 }
 
@@ -182,7 +271,7 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")] // Indicator size is platform dependent.
     fn bytes_per_row() {
-        assert_eq!(5 + 8, BufferDesc::Binary { length: 5 }.bytes_per_row());
+        assert_eq!(5 + 8, BufferDesc::Binary { max_bytes: 5 }.bytes_per_row());
         assert_eq!(
             5 + 1 + 8,
             BufferDesc::Text { max_str_len: 5 }.bytes_per_row()
@@ -206,5 +295,6 @@ mod tests {
         assert_eq!(4, BufferDesc::I32 { nullable: false }.bytes_per_row());
         assert_eq!(8, BufferDesc::I64 { nullable: false }.bytes_per_row());
         assert_eq!(1, BufferDesc::U8 { nullable: false }.bytes_per_row());
+        assert_eq!(19, BufferDesc::Numeric.bytes_per_row());
     }
 }

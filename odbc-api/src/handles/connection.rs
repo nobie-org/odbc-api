@@ -1,30 +1,30 @@
 use super::{
-    as_handle::AsHandle,
+    OutputStringBuffer, SqlResult,
+    any_handle::AnyHandle,
     buffer::mut_buf_ptr,
     drop_handle,
     sql_char::{
-        binary_length, is_truncated_bin, resize_to_fit_with_tz, resize_to_fit_without_tz, SqlChar,
-        SqlText,
+        SqlChar, SqlText, binary_length, is_truncated_bin, resize_to_fit_with_tz,
+        resize_to_fit_without_tz,
     },
     sql_result::ExtSqlReturn,
     statement::StatementImpl,
-    OutputStringBuffer, SqlResult,
 };
-use log::debug;
+use log::trace;
 use odbc_sys::{
-    CompletionType, ConnectionAttribute, DriverConnectOption, HDbc, HEnv, HStmt, HWnd, Handle,
-    HandleType, InfoType, Pointer, SQLAllocHandle, SQLDisconnect, SQLEndTran, IS_UINTEGER,
+    CompletionType, ConnectionAttribute, DriverConnectOption, HDbc, HEnv, HWnd, Handle, HandleType,
+    IS_UINTEGER, InfoType, Pointer, SQLAllocHandle, SQLDisconnect, SQLEndTran,
 };
-use std::{ffi::c_void, marker::PhantomData, mem::size_of, ptr::null_mut};
+use std::{cmp::max, ffi::c_void, marker::PhantomData, mem::size_of, ptr::null_mut};
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 use odbc_sys::{
     SQLConnect as sql_connect, SQLDriverConnect as sql_driver_connect,
     SQLGetConnectAttr as sql_get_connect_attr, SQLGetInfo as sql_get_info,
     SQLSetConnectAttr as sql_set_connect_attr,
 };
 
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 use odbc_sys::{
     SQLConnectW as sql_connect, SQLDriverConnectW as sql_driver_connect,
     SQLGetConnectAttrW as sql_get_connect_attr, SQLGetInfoW as sql_get_info,
@@ -42,9 +42,9 @@ pub struct Connection<'c> {
     handle: HDbc,
 }
 
-unsafe impl<'c> AsHandle for Connection<'c> {
+unsafe impl AnyHandle for Connection<'_> {
     fn as_handle(&self) -> Handle {
-        self.handle as Handle
+        self.handle.as_handle()
     }
 
     fn handle_type(&self) -> HandleType {
@@ -52,10 +52,10 @@ unsafe impl<'c> AsHandle for Connection<'c> {
     }
 }
 
-impl<'c> Drop for Connection<'c> {
+impl Drop for Connection<'_> {
     fn drop(&mut self) {
         unsafe {
-            drop_handle(self.handle as Handle, HandleType::Dbc);
+            drop_handle(self.handle.as_handle(), HandleType::Dbc);
         }
     }
 }
@@ -63,15 +63,31 @@ impl<'c> Drop for Connection<'c> {
 /// According to the ODBC documentation this is safe. See:
 /// <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/multithreading>
 ///
+/// Operations to a connection imply that interior state of the connection might be mutated, yet we
+/// use a `&self` reference for most methods rather than `&mut self`. This means [`Connection`] must
+/// not be `Sync`. `Send` however is fine, due to the guarantees given by the ODBC interface.
+/// However, there might be a difference, between what ODBC demands from drivers and how they are
+/// actually implemented. However, even in practice the situation seems to have improved enuough to
+/// allow for [`Connection`]s to be regarded as `Send` without alerting the author of the ODBC
+/// application. If the driver has a bug, it is just that.
+///
 /// In addition to that, this has not caused trouble in a while. So we mark sending connections to
 /// other threads as safe. Reading through the documentation, one might get the impression that
 /// Connections are also `Sync`. This could be theoretically true on the level of the handle, but at
 /// the latest once the interior mutability due to error handling comes in to play, higher level
 /// abstraction have to content themselves with `Send`. This is currently how far my trust with most
 /// ODBC drivers.
-unsafe impl<'c> Send for Connection<'c> {}
+///
+/// Note to users of `unixodbc`: You may configure the threading level to make unixodbc
+/// synchronize access to the driver (and thereby making them thread safe if they are not thread
+/// safe by themself. This may however hurt your performance if the driver would actually be able to
+/// perform operations in parallel.
+///
+/// See:
+/// <https://stackoverflow.com/questions/4207458/using-unixodbc-in-a-multithreaded-concurrent-setting>
+unsafe impl Send for Connection<'_> {}
 
-impl<'c> Connection<'c> {
+impl Connection<'_> {
     /// # Safety
     ///
     /// Call this method only with a valid (successfully allocated) ODBC connection handle.
@@ -95,7 +111,7 @@ impl<'c> Connection<'c> {
     /// # Arguments
     ///
     /// * `data_source_name` - Data source name. The data might be located on the same computer as
-    /// the program, or on another computer somewhere on a network.
+    ///   the program, or on another computer somewhere on a network.
     /// * `user` - User identifier.
     /// * `pwd` - Authentication string (typically the password).
     ///
@@ -157,17 +173,19 @@ impl<'c> Connection<'c> {
         completed_connection_string: &mut OutputStringBuffer,
         driver_completion: DriverConnectOption,
     ) -> SqlResult<()> {
-        sql_driver_connect(
-            self.handle,
-            parent_window,
-            connection_string.ptr(),
-            connection_string.len_char().try_into().unwrap(),
-            completed_connection_string.mut_buf_ptr(),
-            completed_connection_string.buf_len(),
-            completed_connection_string.mut_actual_len_ptr(),
-            driver_completion,
-        )
-        .into_sql_result("SQLDriverConnect")
+        unsafe {
+            sql_driver_connect(
+                self.handle,
+                parent_window,
+                connection_string.ptr(),
+                connection_string.len_char().try_into().unwrap(),
+                completed_connection_string.mut_buf_ptr(),
+                completed_connection_string.buf_len(),
+                completed_connection_string.mut_actual_len_ptr(),
+                driver_completion,
+            )
+            .into_sql_result("SQLDriverConnect")
+        }
     }
 
     /// Disconnect from an ODBC data source.
@@ -177,11 +195,11 @@ impl<'c> Connection<'c> {
 
     /// Allocate a new statement handle. The `Statement` must not outlive the `Connection`.
     pub fn allocate_statement(&self) -> SqlResult<StatementImpl<'_>> {
-        let mut out = null_mut();
+        let mut out = Handle::null();
         unsafe {
             SQLAllocHandle(HandleType::Stmt, self.as_handle(), &mut out)
                 .into_sql_result("SQLAllocHandle")
-                .on_success(|| StatementImpl::new(out as HStmt))
+                .on_success(|| StatementImpl::new(out.as_hstmt()))
         }
     }
 
@@ -190,16 +208,7 @@ impl<'c> Connection<'c> {
     /// from manual-commit mode to auto-commit mode automatically commits any open transaction on
     /// the connection.
     pub fn set_autocommit(&self, enabled: bool) -> SqlResult<()> {
-        let val = enabled as u32;
-        unsafe {
-            sql_set_connect_attr(
-                self.handle,
-                ConnectionAttribute::AutoCommit,
-                val as Pointer,
-                0, // will be ignored according to ODBC spec
-            )
-            .into_sql_result("SQLSetConnectAttr")
-        }
+        unsafe { self.set_attribute(AutocommitConnectionAttribute(enabled)) }
     }
 
     /// Number of seconds to wait for a login request to complete before returning to the
@@ -214,15 +223,7 @@ impl<'c> Connection<'c> {
     /// See:
     /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetconnectattr-function>
     pub fn set_login_timeout_sec(&self, timeout: u32) -> SqlResult<()> {
-        unsafe {
-            sql_set_connect_attr(
-                self.handle,
-                ConnectionAttribute::LoginTimeout,
-                timeout as Pointer,
-                0,
-            )
-            .into_sql_result("SQLSetConnectAttr")
-        }
+        unsafe { self.set_attribute(LoginTimeoutConnectionAttribute(timeout)) }
     }
 
     /// Specifying the network packet size in bytes. Note: Many data sources either do not support
@@ -235,15 +236,7 @@ impl<'c> Connection<'c> {
     /// See:
     /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetconnectattr-function>
     pub fn set_packet_size(&self, packet_size: u32) -> SqlResult<()> {
-        unsafe {
-            sql_set_connect_attr(
-                self.handle,
-                ConnectionAttribute::PacketSize,
-                packet_size as Pointer,
-                0,
-            )
-            .into_sql_result("SQLSetConnectAttr")
-        }
+        unsafe { self.set_attribute(PacketSizeConnectionAttribute(packet_size)) }
     }
 
     /// To commit a transaction in manual-commit mode.
@@ -267,8 +260,21 @@ impl<'c> Connection<'c> {
     pub fn fetch_database_management_system_name(&self, buf: &mut Vec<SqlChar>) -> SqlResult<()> {
         // String length in bytes, not characters. Terminating zero is excluded.
         let mut string_length_in_bytes: i16 = 0;
-        // Let's utilize all of `buf`s capacity.
-        buf.resize(buf.capacity(), 0);
+
+        // We want to utilize the entire capacity of `buf` independent of its current size. There
+        // also has been an bud in the DuckDB driver not providing the length of the name if called
+        // with an empty buffer. See: <https://github.com/pacman82/odbc-api/pull/818>.
+        //
+        // Other drivers seem to only report the size correctly if the buffer is set to 0 or at
+        // already large enough to contain the entire name. These drivers then report the numbef of
+        // characters that have been returned instead of the number of characters which could have
+        // been returned. Therfore a truncation would not be detected. E.g. the linux drivers of
+        // Microsoft SQL Server and SQLite.
+        //
+        // Setting the buffer to a size large enough to likely hold the name sidesteps issues on
+        // these drivers. Mainly DuckDB though, as MSSQL and SQLite would work fine with `0`.
+        let buffer_size = max(buf.capacity(), 64);
+        buf.resize(buffer_size, 0);
 
         unsafe {
             let mut res = sql_get_info(
@@ -358,7 +364,7 @@ impl<'c> Connection<'c> {
         unsafe {
             let mut res = sql_get_connect_attr(
                 self.handle,
-                ConnectionAttribute::CurrentCatalog,
+                ConnectionAttribute::CURRENT_CATALOG,
                 mut_buf_ptr(buffer) as Pointer,
                 binary_length(buffer).try_into().unwrap(),
                 &mut string_length_in_bytes as *mut i32,
@@ -373,7 +379,7 @@ impl<'c> Connection<'c> {
                 resize_to_fit_with_tz(buffer, string_length_in_bytes.try_into().unwrap());
                 res = sql_get_connect_attr(
                     self.handle,
-                    ConnectionAttribute::CurrentCatalog,
+                    ConnectionAttribute::CURRENT_CATALOG,
                     mut_buf_ptr(buffer) as Pointer,
                     binary_length(buffer).try_into().unwrap(),
                     &mut string_length_in_bytes as *mut i32,
@@ -395,7 +401,7 @@ impl<'c> Connection<'c> {
     /// the connection is still active.
     pub fn is_dead(&self) -> SqlResult<bool> {
         unsafe {
-            self.attribute_u32(ConnectionAttribute::ConnectionDead)
+            self.attribute_u32(ConnectionAttribute::CONNECTION_DEAD)
                 .map(|v| match v {
                     0 => false,
                     1 => true,
@@ -406,7 +412,31 @@ impl<'c> Connection<'c> {
 
     /// Networ packet size in bytes.
     pub fn packet_size(&self) -> SqlResult<u32> {
-        unsafe { self.attribute_u32(ConnectionAttribute::PacketSize) }
+        unsafe { self.attribute_u32(ConnectionAttribute::PACKET_SIZE) }
+    }
+
+    /// Sets a connection attribute.
+    ///
+    /// # Safety
+    ///
+    /// Connection attribute can control all kinds of behavior and change the nature of the
+    /// connection in a fundamental way. This includes wether calls are blocking or asynchronous,
+    /// wether transactions are explicit or auto-committed. On top of that, the ODBC standard allows
+    /// for drivers to specify their own connection attributes.
+    ///
+    /// The circumstances under which calling this function is safe depends on the attribute in
+    /// question. On top of that, callers must also ensure that the driver would know how to
+    /// interpret the attribute, in order for this call to be safe.
+    pub unsafe fn set_attribute(&self, attribute: impl SetConnectionAttribute) -> SqlResult<()> {
+        unsafe {
+            sql_set_connect_attr(
+                self.handle,
+                attribute.attribute(),
+                attribute.value(),
+                attribute.len(),
+            )
+            .into_sql_result("SQLSetConnectAttr")
+        }
     }
 
     /// # Safety
@@ -414,21 +444,115 @@ impl<'c> Connection<'c> {
     /// Caller must ensure connection attribute is numeric.
     unsafe fn attribute_u32(&self, attribute: ConnectionAttribute) -> SqlResult<u32> {
         let mut out: u32 = 0;
-        sql_get_connect_attr(
-            self.handle,
-            attribute,
-            &mut out as *mut u32 as *mut c_void,
-            IS_UINTEGER,
-            null_mut(),
-        )
+        unsafe {
+            sql_get_connect_attr(
+                self.handle,
+                attribute,
+                &mut out as *mut u32 as *mut c_void,
+                IS_UINTEGER,
+                null_mut(),
+            )
+        }
         .into_sql_result("SQLGetConnectAttr")
         .on_success(|| {
             let handle = self.handle;
-            debug!(
+            #[cfg(not(feature = "structured_logging"))]
+            trace!(
                 "SQLGetConnectAttr called with attribute '{attribute:?}' for connection \
                 '{handle:?}' reported '{out}'."
             );
+            #[cfg(feature = "structured_logging")]
+            trace!(
+                target: "odbc_api",
+                attribute:? = attribute,
+                handle:? = handle,
+                value = out;
+                "Connection attribute queried"
+            );
             out
         })
+    }
+}
+
+/// Indicates that the implementer is can be set as a Connection Attribute. This trait is
+/// implemented for both, attributes which are set after the connection is created, as well as
+/// attributes which are set before connecting.
+///
+/// Users of `odbc-api` usually would not want to implement this themselves and rather use safe
+/// abstractions around setting connection attributes. E.g. providing [`crate::ConnectionOptions`] on
+/// connecting.
+///
+/// A reason to implement this trait in your applicaction code however, could be that you want to
+/// set an attribute which is not part of the ODBC standard, but only supported by your specific
+/// driver, which you happen to know your application will use.
+///
+/// See: <https://learn.microsoft.com/en-us/sql/odbc/reference/develop-app/connection-attributes>
+///
+/// # Safety
+///
+/// Implementers must take care that the results of [`Self::value`] and [`Self::len`] match the
+/// expectations of the ODBC driver for the given `attribute`.
+pub unsafe trait SetConnectionAttribute {
+    /// The Connection Attribute to set.
+    fn attribute(&self) -> ConnectionAttribute;
+
+    /// The interpretation of the returned pointer depends on the value returned by `attribute`.
+    ///
+    /// The value to be set. Depending on `attribute` the pointer value might be directly
+    /// interpreted as an integer value without being dereferenced. If `attribute` is represented as
+    /// text then pointer points to a buffer containing the text.
+    fn value(&self) -> Pointer;
+
+    /// Implementers please see
+    /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetconnectattr-function> in
+    /// order to decide on the correct output for this function
+    fn len(&self) -> i32;
+}
+
+struct PacketSizeConnectionAttribute(pub u32);
+
+unsafe impl SetConnectionAttribute for PacketSizeConnectionAttribute {
+    fn attribute(&self) -> ConnectionAttribute {
+        ConnectionAttribute::PACKET_SIZE
+    }
+
+    fn value(&self) -> Pointer {
+        self.0 as Pointer
+    }
+
+    fn len(&self) -> i32 {
+        IS_UINTEGER // Ignored for integer attributes
+    }
+}
+
+struct LoginTimeoutConnectionAttribute(pub u32);
+
+unsafe impl SetConnectionAttribute for LoginTimeoutConnectionAttribute {
+    fn attribute(&self) -> ConnectionAttribute {
+        ConnectionAttribute::LOGIN_TIMEOUT
+    }
+
+    fn value(&self) -> Pointer {
+        self.0 as Pointer
+    }
+
+    fn len(&self) -> i32 {
+        IS_UINTEGER // Ignored for integer attributes
+    }
+}
+
+struct AutocommitConnectionAttribute(pub bool);
+
+unsafe impl SetConnectionAttribute for AutocommitConnectionAttribute {
+    fn attribute(&self) -> ConnectionAttribute {
+        ConnectionAttribute::AUTOCOMMIT
+    }
+
+    fn value(&self) -> Pointer {
+        (self.0 as u32) as Pointer
+    }
+
+    fn len(&self) -> i32 {
+        IS_UINTEGER // Ignored for integer attributes
     }
 }

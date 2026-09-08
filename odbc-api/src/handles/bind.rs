@@ -13,6 +13,8 @@ use crate::DataType;
 /// In case of variable sized types [`Self::indicator_ptr`] must not exceed the value pointed to by
 /// [`Self::value_ptr`]. This requirement is a bit tricky since, if the same indicator buffer is
 /// used in an output paramater the indicator value may be larger in case of truncation.
+///
+/// The values pointed to must be valid for the lifetime of the [`CData`] instance.
 pub unsafe trait CData {
     /// The identifier of the C data type of the value buffer. When it is retrieving data from the
     /// data source with `fetch`, the driver converts the data to this type. When it sends data to
@@ -54,7 +56,7 @@ pub unsafe trait CDataMut: CData {
 /// [`Self::stream_ptr`] must return a valid pointer to a reference of a dynamic Blob trait object
 /// `(*mut &mut dyn Blob)` which must at least be valid for the lifetime of the instance. The
 /// indicator pointer and C data type must describe that instance truthfully.
-pub unsafe trait DelayedInput {
+pub unsafe trait DelayedInput: Send {
     /// Then streaming data to the "data source" the driver converts the data from this type.
     fn cdata_type(&self) -> CDataType;
 

@@ -1,5 +1,6 @@
 use super::{
-    as_handle::AsHandle,
+    CData, Descriptor, SqlChar, SqlResult, SqlText,
+    any_handle::AnyHandle,
     bind::{CDataMut, DelayedInput, HasDataType},
     buffer::{clamp_small_int, mut_buf_ptr},
     column_description::{ColumnDescription, Nullability},
@@ -7,45 +8,58 @@ use super::{
     drop_handle,
     sql_char::{binary_length, is_truncated_bin, resize_to_fit_without_tz},
     sql_result::ExtSqlReturn,
-    CData, Descriptor, SqlChar, SqlResult, SqlText,
 };
-use log::debug;
+use log::trace;
 use odbc_sys::{
-    Desc, FreeStmtOption, HDbc, HStmt, Handle, HandleType, Len, ParamType, Pointer, SQLBindCol,
-    SQLBindParameter, SQLCloseCursor, SQLDescribeParam, SQLExecute, SQLFetch, SQLFreeStmt,
-    SQLGetData, SQLMoreResults, SQLNumParams, SQLNumResultCols, SQLParamData, SQLPutData,
-    SQLRowCount, SqlDataType, SqlReturn, StatementAttribute, IS_POINTER,
+    Desc, FreeStmtOption, HDbc, HDesc, HStmt, Handle, HandleType, IS_POINTER, Len, ParamType,
+    Pointer, SQLBindCol, SQLBindParameter, SQLCloseCursor, SQLDescribeParam, SQLExecute, SQLFetch,
+    SQLFreeStmt, SQLGetData, SQLMoreResults, SQLNumParams, SQLNumResultCols, SQLParamData,
+    SQLPutData, SQLRowCount, SqlDataType, SqlReturn, StatementAttribute,
 };
-use std::{ffi::c_void, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr::null_mut};
+use std::{
+    ffi::c_void,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    num::NonZeroUsize,
+    ptr::{null, null_mut},
+};
 
 #[cfg(feature = "odbc_version_3_80")]
 use odbc_sys::SQLCompleteAsync;
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 use odbc_sys::{
     SQLColAttribute as sql_col_attribute, SQLColumns as sql_columns,
     SQLDescribeCol as sql_describe_col, SQLExecDirect as sql_exec_direc,
-    SQLForeignKeys as sql_foreign_keys, SQLPrepare as sql_prepare,
+    SQLForeignKeys as sql_foreign_keys, SQLGetStmtAttr as sql_get_stmt_attr,
+    SQLPrepare as sql_prepare, SQLPrimaryKeys as sql_primary_keys,
     SQLSetStmtAttr as sql_set_stmt_attr, SQLTables as sql_tables,
 };
 
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 use odbc_sys::{
     SQLColAttributeW as sql_col_attribute, SQLColumnsW as sql_columns,
     SQLDescribeColW as sql_describe_col, SQLExecDirectW as sql_exec_direc,
-    SQLForeignKeysW as sql_foreign_keys, SQLPrepareW as sql_prepare,
+    SQLForeignKeysW as sql_foreign_keys, SQLGetStmtAttrW as sql_get_stmt_attr,
+    SQLPrepareW as sql_prepare, SQLPrimaryKeysW as sql_primary_keys,
     SQLSetStmtAttrW as sql_set_stmt_attr, SQLTablesW as sql_tables,
 };
 
-/// An owned valid (i.e. successfully allocated) ODBC statement handle.
+/// An owned valid (i.e. successfully allocated) ODBC statement handle. [`StatementImpl`] borrows
+/// the parent connection used to create the handle in order to ensure the Parent is alive and valid
+/// during the lifetime of the statement.
+///
+/// If you want a handle to the statement that instead of borrowing the parent connection does own
+/// it, you should use [`super::StatementConnection`] instead.
+#[derive(Debug)]
 pub struct StatementImpl<'s> {
     parent: PhantomData<&'s HDbc>,
     handle: HStmt,
 }
 
-unsafe impl<'c> AsHandle for StatementImpl<'c> {
+unsafe impl AnyHandle for StatementImpl<'_> {
     fn as_handle(&self) -> Handle {
-        self.handle as Handle
+        self.handle.as_handle()
     }
 
     fn handle_type(&self) -> HandleType {
@@ -53,15 +67,15 @@ unsafe impl<'c> AsHandle for StatementImpl<'c> {
     }
 }
 
-impl<'s> Drop for StatementImpl<'s> {
+impl Drop for StatementImpl<'_> {
     fn drop(&mut self) {
         unsafe {
-            drop_handle(self.handle as Handle, HandleType::Stmt);
+            drop_handle(self.handle.as_handle(), HandleType::Stmt);
         }
     }
 }
 
-impl<'s> StatementImpl<'s> {
+impl StatementImpl<'_> {
     /// # Safety
     ///
     /// `handle` must be a valid (successfully allocated) statement handle.
@@ -89,16 +103,32 @@ impl<'s> StatementImpl<'s> {
     }
 }
 
+/// According to the ODBC documentation this is safe. See:
+/// <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/multithreading>
+///
+/// We maybe could consider a statement to be `Sync` as well, since all operations on it currently
+/// require `&mut self`. Yet maybe we get forced to allow some of these operations to take `&self`
+/// in the future, like we do for [`crate::Connection`] to allow for shared ownership of
+/// connections by multiple statements.
+///
+/// A non obvious implication of implementing `Send` for `StatementImpl` is that we must demand all
+/// parameters bound to the statement are also `Send`. There might be room for a statement handle
+/// which is not `Send`, but could therefore bind also parameters which are not `Send`. So far it is
+/// not clear in what use-case we would need this. Yet there are  multithreaded programs out there
+/// which want to make use of ODBC.
+unsafe impl Send for StatementImpl<'_> {}
+
 /// A borrowed valid (i.e. successfully allocated) ODBC statement handle. This can be used instead
 /// of a mutable reference to a [`StatementImpl`]. The main advantage here is that the lifetime
 /// paramater remains covariant, whereas if we would just take a mutable reference to an owned
 /// statement it would become invariant.
+#[derive(Debug)]
 pub struct StatementRef<'s> {
     parent: PhantomData<&'s HDbc>,
     handle: HStmt,
 }
 
-impl<'s> StatementRef<'s> {
+impl StatementRef<'_> {
     pub(crate) unsafe fn new(handle: HStmt) -> Self {
         Self {
             handle,
@@ -107,21 +137,34 @@ impl<'s> StatementRef<'s> {
     }
 }
 
-impl<'s> Statement for StatementRef<'s> {
+impl Statement for StatementRef<'_> {
     fn as_sys(&self) -> HStmt {
         self.handle
     }
+
+    fn end_cursor_scope(&mut self) -> SqlResult<()> {
+        self.close_cursor()
+    }
 }
 
-unsafe impl<'c> AsHandle for StatementRef<'c> {
+unsafe impl AnyHandle for StatementRef<'_> {
     fn as_handle(&self) -> Handle {
-        self.handle as Handle
+        self.handle.as_handle()
     }
 
     fn handle_type(&self) -> HandleType {
         HandleType::Stmt
     }
 }
+
+/// According to the ODBC documentation this is safe. See:
+/// <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/multithreading>
+///
+/// We maybe could consider a statement to be `Sync` as well, since all operations on it currently
+/// require `&mut self`. Yet maybe we get forced to allow some of these operations to take `&self`
+/// in the future, like we do for [`crate::Connection`] to allow for shared ownership of
+/// connections by multiple statements.
+unsafe impl Send for StatementRef<'_> {}
 
 /// Allows us to be generic over the ownership type (mutably borrowed or owned) of a statement
 pub trait AsStatementRef {
@@ -131,21 +174,12 @@ pub trait AsStatementRef {
     fn as_stmt_ref(&mut self) -> StatementRef<'_>;
 }
 
-impl<'o> AsStatementRef for StatementImpl<'o> {
+impl<T> AsStatementRef for T
+where
+    T: Statement,
+{
     fn as_stmt_ref(&mut self) -> StatementRef<'_> {
-        self.as_stmt_ref()
-    }
-}
-
-impl<'o> AsStatementRef for &mut StatementImpl<'o> {
-    fn as_stmt_ref(&mut self) -> StatementRef<'_> {
-        (*self).as_stmt_ref()
-    }
-}
-
-impl<'s> AsStatementRef for StatementRef<'s> {
-    fn as_stmt_ref(&mut self) -> StatementRef<'_> {
-        unsafe { StatementRef::new(self.handle) }
+        unsafe { StatementRef::new(self.as_sys()) }
     }
 }
 
@@ -157,37 +191,49 @@ impl<'s> AsStatementRef for StatementRef<'s> {
 /// The trait allows us to reason about statements without taking the lifetime of their connection
 /// into account. It also allows for the trait to be implemented by a handle taking ownership of
 /// both, the statement and the connection.
-pub trait Statement: AsHandle {
+pub trait Statement: AnyHandle {
     /// Gain access to the underlying statement handle without transferring ownership to it.
     fn as_sys(&self) -> HStmt;
+
+    /// Invoke [`Self::close_cursor`] to close the cursor for implementations which borrow the
+    /// statement handle. For implementations which own the statement handle exclusively, this is a
+    /// no-op. The idea is that if the statement handle is borrowed, we must assume it is going to
+    /// be reused for other queries, so we must spend the effort to close the cursor. If the
+    /// statement handle is exclusively owned it is dropped and freed right away if dropping a
+    /// cursor wrapper. So we do not need to bother with closing the cursor explicitly. The driver
+    /// can take care of it during cleanup however it seems fit.
+    fn end_cursor_scope(&mut self) -> SqlResult<()>;
 
     /// Binds application data buffers to columns in the result set.
     ///
     /// * `column_number`: `0` is the bookmark column. It is not included in some result sets. All
-    /// other columns are numbered starting with `1`. It is an error to bind a higher-numbered
-    /// column than there are columns in the result set. This error cannot be detected until the
-    /// result set has been created, so it is returned by `fetch`, not `bind_col`.
+    ///   other columns are numbered starting with `1`. It is an error to bind a higher-numbered
+    ///   column than there are columns in the result set. This error cannot be detected until the
+    ///   result set has been created, so it is returned by `fetch`, not `bind_col`.
     /// * `target_type`: The identifier of the C data type of the `value` buffer. When it is
-    /// retrieving data from the data source with `fetch`, the driver converts the data to this
-    /// type. When it sends data to the source, the driver converts the data from this type.
+    ///   retrieving data from the data source with `fetch`, the driver converts the data to this
+    ///   type. When it sends data to the source, the driver converts the data from this type.
     /// * `target_value`: Pointer to the data buffer to bind to the column.
     /// * `target_length`: Length of target value in bytes. (Or for a single element in case of bulk
-    /// aka. block fetching data).
+    ///   aka. block fetching data).
     /// * `indicator`: Buffer is going to hold length or indicator values.
     ///
     /// # Safety
     ///
     /// It is the callers responsibility to make sure the bound columns live until they are no
-    /// longer bound.
+    /// longer bound. I.e. `target` must live long enough to cover every read of the bound value
+    /// pointers until they are unbound.
     unsafe fn bind_col(&mut self, column_number: u16, target: &mut impl CDataMut) -> SqlResult<()> {
-        SQLBindCol(
-            self.as_sys(),
-            column_number,
-            target.cdata_type(),
-            target.mut_value_ptr(),
-            target.buffer_length(),
-            target.mut_indicator_ptr(),
-        )
+        unsafe {
+            SQLBindCol(
+                self.as_sys(),
+                column_number,
+                target.cdata_type(),
+                target.mut_value_ptr(),
+                target.buffer_length(),
+                target.mut_indicator_ptr(),
+            )
+        }
         .into_sql_result("SQLBindCol")
     }
 
@@ -203,7 +249,7 @@ pub trait Statement: AsHandle {
     ///
     /// Fetch dereferences bound column pointers.
     unsafe fn fetch(&mut self) -> SqlResult<()> {
-        SQLFetch(self.as_sys()).into_sql_result("SQLFetch")
+        unsafe { SQLFetch(self.as_sys()) }.into_sql_result("SQLFetch")
     }
 
     /// Retrieves data for a single column in the result set or for a single parameter.
@@ -234,13 +280,52 @@ pub trait Statement: AsHandle {
     /// `num_rows` must not be moved and remain valid, as long as it remains bound to the cursor.
     unsafe fn set_num_rows_fetched(&mut self, num_rows: &mut usize) -> SqlResult<()> {
         let value = num_rows as *mut usize as Pointer;
-        sql_set_stmt_attr(
-            self.as_sys(),
-            StatementAttribute::RowsFetchedPtr,
-            value,
-            IS_POINTER,
-        )
+        unsafe {
+            sql_set_stmt_attr(
+                self.as_sys(),
+                StatementAttribute::RowsFetchedPtr,
+                value,
+                IS_POINTER,
+            )
+        }
         .into_sql_result("SQLSetStmtAttr")
+    }
+
+    /// The number of seconds to wait for an SQL statement to execute before returning to the
+    /// application. If `timeout_sec` is `0` (default), there is no timeout.
+    ///
+    /// Note that the application need not call SQLCloseCursor to reuse the statement if a SELECT
+    /// statement timed out.
+    ///
+    /// This corresponds to `SQL_ATTR_QUERY_TIMEOUT` in the ODBC C API.
+    ///
+    /// See:
+    /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetstmtattr-function>
+    fn set_query_timeout_sec(&mut self, timeout_sec: usize) -> SqlResult<()> {
+        let value = timeout_sec as *mut usize as Pointer;
+        // This is safe, because `.as_sys`  returns a valid statement handle.
+        unsafe { sql_set_stmt_attr(self.as_sys(), StatementAttribute::QueryTimeout, value, 0) }
+            .into_sql_result("SQLSetStmtAttr")
+    }
+
+    /// The number of seconds to wait for an SQL statement to execute before returning to the
+    /// application. If `timeout_sec` is `0` (default), there is no timeout.
+    ///
+    /// This corresponds to `SQL_ATTR_QUERY_TIMEOUT` in the ODBC C API.
+    fn query_timeout_sec(&mut self) -> SqlResult<usize> {
+        let mut out: usize = 0;
+        let value = &mut out as *mut usize as Pointer;
+        unsafe {
+            sql_get_stmt_attr(
+                self.as_sys(),
+                StatementAttribute::QueryTimeout,
+                value,
+                0,
+                null_mut(),
+            )
+        }
+        .into_sql_result("SQLGetStmtAttr")
+        .on_success(|| out)
     }
 
     /// Unsets the integer set by [`Self::set_num_rows_fetched`].
@@ -264,12 +349,12 @@ pub trait Statement: AsHandle {
     /// # Parameters
     ///
     /// * `column_number`: Column index. `0` is the bookmark column. The other column indices start
-    /// with `1`.
+    ///   with `1`.
     /// * `column_description`: Holds the description of the column after the call. This method does
-    /// not provide strong exception safety as the value of this argument is undefined in case of an
-    /// error.
+    ///   not provide strong exception safety as the value of this argument is undefined in case of
+    ///   an error.
     fn describe_col(
-        &self,
+        &mut self,
         column_number: u16,
         column_description: &mut ColumnDescription,
     ) -> SqlResult<()> {
@@ -331,11 +416,13 @@ pub trait Statement: AsHandle {
     /// * [`SqlResult::NoData`] if a searched update or delete statement did not affect any rows at
     ///   the data source.
     unsafe fn exec_direct(&mut self, statement: &SqlText) -> SqlResult<()> {
-        sql_exec_direc(
-            self.as_sys(),
-            statement.ptr(),
-            statement.len_char().try_into().unwrap(),
-        )
+        unsafe {
+            sql_exec_direc(
+                self.as_sys(),
+                statement.ptr(),
+                statement.len_char().try_into().unwrap(),
+            )
+        }
         .into_sql_result("SQLExecDirect")
     }
 
@@ -375,13 +462,13 @@ pub trait Statement: AsHandle {
     /// * [`SqlResult::NoData`] if a searched update or delete statement did not affect any rows at
     ///   the data source.
     unsafe fn execute(&mut self) -> SqlResult<()> {
-        SQLExecute(self.as_sys()).into_sql_result("SQLExecute")
+        unsafe { SQLExecute(self.as_sys()) }.into_sql_result("SQLExecute")
     }
 
     /// Number of columns in result set.
     ///
     /// Can also be used to check, whether or not a result set has been created at all.
-    fn num_result_cols(&self) -> SqlResult<i16> {
+    fn num_result_cols(&mut self) -> SqlResult<i16> {
         let mut out: i16 = 0;
         unsafe { SQLNumResultCols(self.as_sys(), &mut out) }
             .into_sql_result("SQLNumResultCols")
@@ -389,7 +476,7 @@ pub trait Statement: AsHandle {
     }
 
     /// Number of placeholders of a prepared query.
-    fn num_params(&self) -> SqlResult<u16> {
+    fn num_params(&mut self) -> SqlResult<u16> {
         let mut out: i16 = 0;
         unsafe { SQLNumParams(self.as_sys(), &mut out) }
             .into_sql_result("SQLNumParams")
@@ -404,13 +491,32 @@ pub trait Statement: AsHandle {
     /// specified amount of rows.
     unsafe fn set_row_array_size(&mut self, size: usize) -> SqlResult<()> {
         assert!(size > 0);
-        sql_set_stmt_attr(
-            self.as_sys(),
-            StatementAttribute::RowArraySize,
-            size as Pointer,
-            0,
-        )
+        unsafe {
+            sql_set_stmt_attr(
+                self.as_sys(),
+                StatementAttribute::RowArraySize,
+                size as Pointer,
+                0,
+            )
+        }
         .into_sql_result("SQLSetStmtAttr")
+    }
+
+    /// Gets the batch size for bulk cursors, if retrieving many rows at once.
+    fn row_array_size(&mut self) -> SqlResult<usize> {
+        let mut out: usize = 0;
+        let value = &mut out as *mut usize as Pointer;
+        unsafe {
+            sql_get_stmt_attr(
+                self.as_sys(),
+                StatementAttribute::RowArraySize,
+                value,
+                0,
+                null_mut(),
+            )
+        }
+        .into_sql_result("SQLGetStmtAttr")
+        .on_success(|| out)
     }
 
     /// Specifies the number of values for each parameter. If it is greater than 1, the data and
@@ -423,12 +529,14 @@ pub trait Statement: AsHandle {
     /// statement is executed.
     unsafe fn set_paramset_size(&mut self, size: usize) -> SqlResult<()> {
         assert!(size > 0);
-        sql_set_stmt_attr(
-            self.as_sys(),
-            StatementAttribute::ParamsetSize,
-            size as Pointer,
-            0,
-        )
+        unsafe {
+            sql_set_stmt_attr(
+                self.as_sys(),
+                StatementAttribute::ParamsetSize,
+                size as Pointer,
+                0,
+            )
+        }
         .into_sql_result("SQLSetStmtAttr")
     }
 
@@ -442,12 +550,14 @@ pub trait Statement: AsHandle {
     /// It is the callers responsibility to ensure that the bound buffers match the memory layout
     /// specified by this function.
     unsafe fn set_row_bind_type(&mut self, row_size: usize) -> SqlResult<()> {
-        sql_set_stmt_attr(
-            self.as_sys(),
-            StatementAttribute::RowBindType,
-            row_size as Pointer,
-            0,
-        )
+        unsafe {
+            sql_set_stmt_attr(
+                self.as_sys(),
+                StatementAttribute::RowBindType,
+                row_size as Pointer,
+                0,
+            )
+        }
         .into_sql_result("SQLSetStmtAttr")
     }
 
@@ -498,26 +608,28 @@ pub trait Statement: AsHandle {
     unsafe fn bind_input_parameter(
         &mut self,
         parameter_number: u16,
-        parameter: &(impl HasDataType + CData + ?Sized),
+        parameter: &(impl HasDataType + CData + ?Sized + Send),
     ) -> SqlResult<()> {
         let parameter_type = parameter.data_type();
-        SQLBindParameter(
-            self.as_sys(),
-            parameter_number,
-            ParamType::Input,
-            parameter.cdata_type(),
-            parameter_type.data_type(),
-            parameter_type
-                .column_size()
-                .map(NonZeroUsize::get)
-                .unwrap_or_default(),
-            parameter_type.decimal_digits(),
-            // We cast const to mut here, but we specify the input_output_type as input.
-            parameter.value_ptr() as *mut c_void,
-            parameter.buffer_length(),
-            // We cast const to mut here, but we specify the input_output_type as input.
-            parameter.indicator_ptr() as *mut isize,
-        )
+        unsafe {
+            SQLBindParameter(
+                self.as_sys(),
+                parameter_number,
+                ParamType::Input,
+                parameter.cdata_type(),
+                parameter_type.data_type(),
+                parameter_type
+                    .column_size()
+                    .map(NonZeroUsize::get)
+                    .unwrap_or_default(),
+                parameter_type.decimal_digits(),
+                // We cast const to mut here, but we specify the input_output_type as input.
+                parameter.value_ptr() as *mut c_void,
+                parameter.buffer_length(),
+                // We cast const to mut here, but we specify the input_output_type as input.
+                parameter.indicator_ptr() as *mut isize,
+            )
+        }
         .into_sql_result("SQLBindParameter")
     }
 
@@ -536,24 +648,26 @@ pub trait Statement: AsHandle {
         &mut self,
         parameter_number: u16,
         input_output_type: ParamType,
-        parameter: &mut (impl CDataMut + HasDataType),
+        parameter: &mut (impl CDataMut + HasDataType + Send),
     ) -> SqlResult<()> {
         let parameter_type = parameter.data_type();
-        SQLBindParameter(
-            self.as_sys(),
-            parameter_number,
-            input_output_type,
-            parameter.cdata_type(),
-            parameter_type.data_type(),
-            parameter_type
-                .column_size()
-                .map(NonZeroUsize::get)
-                .unwrap_or_default(),
-            parameter_type.decimal_digits(),
-            parameter.value_ptr() as *mut c_void,
-            parameter.buffer_length(),
-            parameter.mut_indicator_ptr(),
-        )
+        unsafe {
+            SQLBindParameter(
+                self.as_sys(),
+                parameter_number,
+                input_output_type,
+                parameter.cdata_type(),
+                parameter_type.data_type(),
+                parameter_type
+                    .column_size()
+                    .map(NonZeroUsize::get)
+                    .unwrap_or_default(),
+                parameter_type.decimal_digits(),
+                parameter.value_ptr() as *mut c_void,
+                parameter.buffer_length(),
+                parameter.mut_indicator_ptr(),
+            )
+        }
         .into_sql_result("SQLBindParameter")
     }
 
@@ -573,22 +687,24 @@ pub trait Statement: AsHandle {
         parameter: &mut (impl DelayedInput + HasDataType),
     ) -> SqlResult<()> {
         let paramater_type = parameter.data_type();
-        SQLBindParameter(
-            self.as_sys(),
-            parameter_number,
-            ParamType::Input,
-            parameter.cdata_type(),
-            paramater_type.data_type(),
-            paramater_type
-                .column_size()
-                .map(NonZeroUsize::get)
-                .unwrap_or_default(),
-            paramater_type.decimal_digits(),
-            parameter.stream_ptr(),
-            0,
-            // We cast const to mut here, but we specify the input_output_type as input.
-            parameter.indicator_ptr() as *mut isize,
-        )
+        unsafe {
+            SQLBindParameter(
+                self.as_sys(),
+                parameter_number,
+                ParamType::Input,
+                parameter.cdata_type(),
+                paramater_type.data_type(),
+                paramater_type
+                    .column_size()
+                    .map(NonZeroUsize::get)
+                    .unwrap_or_default(),
+                paramater_type.decimal_digits(),
+                parameter.stream_ptr(),
+                0,
+                // We cast const to mut here, but we specify the input_output_type as input.
+                parameter.indicator_ptr() as *mut isize,
+            )
+        }
         .into_sql_result("SQLBindParameter")
     }
 
@@ -596,7 +712,7 @@ pub trait Statement: AsHandle {
     /// otherwise.
     ///
     /// `column_number`: Index of the column, starting at 1.
-    fn is_unsigned_column(&self, column_number: u16) -> SqlResult<bool> {
+    fn is_unsigned_column(&mut self, column_number: u16) -> SqlResult<bool> {
         unsafe { self.numeric_col_attribute(Desc::Unsigned, column_number) }.map(|out| match out {
             0 => false,
             1 => true,
@@ -607,7 +723,7 @@ pub trait Statement: AsHandle {
     /// Returns a number identifying the SQL type of the column in the result set.
     ///
     /// `column_number`: Index of the column, starting at 1.
-    fn col_type(&self, column_number: u16) -> SqlResult<SqlDataType> {
+    fn col_type(&mut self, column_number: u16) -> SqlResult<SqlDataType> {
         unsafe { self.numeric_col_attribute(Desc::Type, column_number) }.map(|ret| {
             SqlDataType(ret.try_into().expect(
                 "Failed to retrieve data type from ODBC driver. The SQLLEN could not be converted to
@@ -623,7 +739,7 @@ pub trait Statement: AsHandle {
     /// concise data type; for example, `TIME` or `INTERVAL_YEAR`.
     ///
     /// `column_number`: Index of the column, starting at 1.
-    fn col_concise_type(&self, column_number: u16) -> SqlResult<SqlDataType> {
+    fn col_concise_type(&mut self, column_number: u16) -> SqlResult<SqlDataType> {
         unsafe { self.numeric_col_attribute(Desc::ConciseType, column_number) }.map(|ret| {
             SqlDataType(ret.try_into().expect(
                 "Failed to retrieve data type from ODBC driver. The SQLLEN could not be \
@@ -639,14 +755,14 @@ pub trait Statement: AsHandle {
     /// returned, excluding a terminating zero.
     ///
     /// `column_number`: Index of the column, starting at 1.
-    fn col_octet_length(&self, column_number: u16) -> SqlResult<isize> {
+    fn col_octet_length(&mut self, column_number: u16) -> SqlResult<isize> {
         unsafe { self.numeric_col_attribute(Desc::OctetLength, column_number) }
     }
 
     /// Maximum number of characters required to display data from the column.
     ///
     /// `column_number`: Index of the column, starting at 1.
-    fn col_display_size(&self, column_number: u16) -> SqlResult<isize> {
+    fn col_display_size(&mut self, column_number: u16) -> SqlResult<isize> {
         unsafe { self.numeric_col_attribute(Desc::DisplaySize, column_number) }
     }
 
@@ -655,19 +771,30 @@ pub trait Statement: AsHandle {
     /// Denotes the applicable precision. For data types SQL_TYPE_TIME, SQL_TYPE_TIMESTAMP, and all
     /// the interval data types that represent a time interval, its value is the applicable
     /// precision of the fractional seconds component.
-    fn col_precision(&self, column_number: u16) -> SqlResult<isize> {
+    fn col_precision(&mut self, column_number: u16) -> SqlResult<isize> {
         unsafe { self.numeric_col_attribute(Desc::Precision, column_number) }
     }
 
     /// The applicable scale for a numeric data type. For DECIMAL and NUMERIC data types, this is
     /// the defined scale. It is undefined for all other data types.
-    fn col_scale(&self, column_number: u16) -> SqlResult<Len> {
+    fn col_scale(&mut self, column_number: u16) -> SqlResult<isize> {
         unsafe { self.numeric_col_attribute(Desc::Scale, column_number) }
+    }
+
+    /// Nullability of the column.
+    ///
+    /// `column_number`: Index of the column, starting at 1.
+    ///
+    /// See `SQL_DESC_NULLABLE ` in the ODBC reference:
+    /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlcolattribute-function>
+    fn col_nullability(&mut self, column_number: u16) -> SqlResult<Nullability> {
+        unsafe { self.numeric_col_attribute(Desc::Nullable, column_number) }
+            .map(|nullability| Nullability::new(odbc_sys::Nullability(nullability as i16)))
     }
 
     /// The column alias, if it applies. If the column alias does not apply, the column name is
     /// returned. If there is no column name or a column alias, an empty string is returned.
-    fn col_name(&self, column_number: u16, buffer: &mut Vec<SqlChar>) -> SqlResult<()> {
+    fn col_name(&mut self, column_number: u16, buffer: &mut Vec<SqlChar>) -> SqlResult<()> {
         // String length in bytes, not characters. Terminating zero is excluded.
         let mut string_length_in_bytes: i16 = 0;
         // Let's utilize all of `buf`s capacity.
@@ -717,22 +844,37 @@ pub trait Statement: AsHandle {
     /// # Safety
     ///
     /// It is the callers responsibility to ensure that `attribute` refers to a numeric attribute.
-    unsafe fn numeric_col_attribute(&self, attribute: Desc, column_number: u16) -> SqlResult<Len> {
+    unsafe fn numeric_col_attribute(
+        &mut self,
+        attribute: Desc,
+        column_number: u16,
+    ) -> SqlResult<Len> {
         let mut out: Len = 0;
-        sql_col_attribute(
-            self.as_sys(),
-            column_number,
-            attribute,
-            null_mut(),
-            0,
-            null_mut(),
-            &mut out as *mut Len,
-        )
+        unsafe {
+            sql_col_attribute(
+                self.as_sys(),
+                column_number,
+                attribute,
+                null_mut(),
+                0,
+                null_mut(),
+                &mut out as *mut Len,
+            )
+        }
         .into_sql_result("SQLColAttribute")
         .on_success(|| {
-            debug!(
+            #[cfg(not(feature = "structured_logging"))]
+            trace!(
                 "SQLColAttribute called with attribute '{attribute:?}' for column \
                 '{column_number}' reported {out}."
+            );
+            #[cfg(feature = "structured_logging")]
+            trace!(
+                target: "odbc_api",
+                attribute:? = attribute,
+                column_number = column_number,
+                value = out;
+                "Column attribute queried"
             );
             out
         })
@@ -752,7 +894,7 @@ pub trait Statement: AsHandle {
     ///
     /// * `parameter_number`: Parameter marker number ordered sequentially in increasing parameter
     ///   order, starting at 1.
-    fn describe_param(&self, parameter_number: u16) -> SqlResult<ParameterDescription> {
+    fn describe_param(&mut self, parameter_number: u16) -> SqlResult<ColumnType> {
         let mut data_type = SqlDataType::UNKNOWN_TYPE;
         let mut parameter_size = 0;
         let mut decimal_digits = 0;
@@ -768,7 +910,7 @@ pub trait Statement: AsHandle {
             )
         }
         .into_sql_result("SQLDescribeParam")
-        .on_success(|| ParameterDescription {
+        .on_success(|| ColumnType {
             data_type: DataType::new(data_type, parameter_size, decimal_digits),
             nullability: Nullability::new(nullable),
         })
@@ -843,6 +985,65 @@ pub trait Statement: AsHandle {
         }
     }
 
+    /// Create a result set which contains the column names that make up the primary key for the
+    /// table.
+    ///
+    /// # Parameters
+    ///
+    /// * `catalog_name`: Catalog name. If a driver supports catalogs for some tables but not for
+    ///   others, such as when the driver retrieves data from different DBMSs, an empty string ("")
+    ///   denotes those tables that do not have catalogs. `catalog_name` must not contain a string
+    ///   search pattern.
+    /// * `schema_name`: Schema name. If a driver supports schemas for some tables but not for
+    ///   others, such as when the driver retrieves data from different DBMSs, an empty string ("")
+    ///   denotes those tables that do not have schemas. `schema_name` must not contain a string
+    ///   search pattern.
+    /// * `table_name`: Table name. `table_name` must not contain a string search pattern.
+    ///
+    /// The resulting result set contains the following columns:
+    ///
+    /// * `TABLE_CAT`: Primary key table catalog name. NULL if not applicable to the data source. If
+    ///   a driver supports catalogs for some tables but not for others, such as when the driver
+    ///   retrieves data from different DBMSs, it returns an empty string ("") for those tables that
+    ///   do not have catalogs. `VARCHAR`
+    /// * `TABLE_SCHEM`: Primary key table schema name; NULL if not applicable to the data source.
+    ///   If a driver supports schemas for some tables but not for others, such as when the driver
+    ///   retrieves data from different DBMSs, it returns an empty string ("") for those tables that
+    ///   do not have schemas. `VARCHAR`
+    /// * `TABLE_NAME`: Primary key table name. `VARCHAR NOT NULL`
+    /// * `COLUMN_NAME`: Primary key column name. The driver returns an empty string for a column
+    ///   that does not have a name. `VARCHAR NOT NULL`
+    /// * `KEY_SEQ`: Column sequence number in key (starting with 1). `SMALLINT NOT NULL`
+    /// * `PK_NAME`: Primary key name. NULL if not applicable to the data source. `VARCHAR`
+    ///
+    /// The maximum length of the VARCHAR columns is driver specific.
+    ///
+    /// If [`StatementAttribute::MetadataId`] statement attribute is set to true, catalog, schema
+    /// and table name parameters are treated as an identifiers and their case is not significant.
+    /// If it is false, they are ordinary arguments. As such they treated literally and their case
+    /// is significant.
+    ///
+    /// See: <https://learn.microsoft.com/sql/odbc/reference/syntax/sqlprimarykeys-function>
+    fn primary_keys(
+        &mut self,
+        catalog_name: Option<&SqlText>,
+        schema_name: Option<&SqlText>,
+        table_name: &SqlText,
+    ) -> SqlResult<()> {
+        unsafe {
+            sql_primary_keys(
+                self.as_sys(),
+                catalog_name.map_or(null(), |c| c.ptr()),
+                catalog_name.map_or(0, |c| c.len_char().try_into().unwrap()),
+                schema_name.map_or(null(), |s| s.ptr()),
+                schema_name.map_or(0, |s| s.len_char().try_into().unwrap()),
+                table_name.ptr(),
+                table_name.len_char().try_into().unwrap(),
+            )
+            .into_sql_result("SQLPrimaryKeys")
+        }
+    }
+
     /// This can be used to retrieve either a list of foreign keys in the specified table or a list
     /// of foreign keys in other table that refer to the primary key of the specified table.
     ///
@@ -903,7 +1104,7 @@ pub trait Statement: AsHandle {
     ///
     /// <https://docs.microsoft.com/en-us/sql/relational-databases/native-client-odbc-api/sqlrowcount>
     /// <https://docs.microsoft.com/en-us/sql/odbc/reference/syntax/sqlrowcount-function>
-    fn row_count(&self) -> SqlResult<isize> {
+    fn row_count(&mut self) -> SqlResult<isize> {
         let mut ret = 0isize;
         unsafe {
             SQLRowCount(self.as_sys(), &mut ret as *mut isize)
@@ -957,8 +1158,8 @@ pub trait Statement: AsHandle {
     /// though.
     fn application_row_descriptor(&mut self) -> SqlResult<Descriptor<'_>> {
         unsafe {
-            let mut hdesc: odbc_sys::HDesc = null_mut();
-            let hdesc_out = &mut hdesc as *mut odbc_sys::HDesc as Pointer;
+            let mut hdesc = HDesc::null();
+            let hdesc_out = &mut hdesc as *mut HDesc as Pointer;
             odbc_sys::SQLGetStmtAttr(
                 self.as_sys(),
                 odbc_sys::StatementAttribute::AppRowDesc,
@@ -970,21 +1171,50 @@ pub trait Statement: AsHandle {
             .on_success(|| Descriptor::new(hdesc))
         }
     }
+
+    /// Application Parameter Descriptor (APD) associated with the statement handle. Describes the
+    /// parameter buffers bound to an SQL statement. Usually there is no need for an application to
+    /// directly interact with the APD. It may be required though to set precision and scale for
+    /// numeric parameters.
+    fn application_parameter_descriptor(&mut self) -> SqlResult<Descriptor<'_>> {
+        unsafe {
+            let mut hdesc = HDesc::null();
+            let hdesc_out = &mut hdesc as *mut HDesc as Pointer;
+            odbc_sys::SQLGetStmtAttr(
+                self.as_sys(),
+                odbc_sys::StatementAttribute::AppParamDesc,
+                hdesc_out,
+                0,
+                null_mut(),
+            )
+            .into_sql_result("SQLGetStmtAttr")
+            .on_success(|| Descriptor::new(hdesc))
+        }
+    }
 }
 
-impl<'o> Statement for StatementImpl<'o> {
+impl Statement for StatementImpl<'_> {
     /// Gain access to the underlying statement handle without transferring ownership to it.
     fn as_sys(&self) -> HStmt {
         self.handle
     }
+
+    fn end_cursor_scope(&mut self) -> SqlResult<()> {
+        // No-op. We own the statement handle exclusively. We can assume it is freed right after.
+        SqlResult::Success(())
+    }
 }
 
-/// Description of a parameter associated with a parameter marker in a prepared statement. Returned
-/// by [`crate::Prepared::describe_param`].
+/// The relational type of a column or parameter, including nullability. Returned e.g. by
+/// [`crate::Prepared::describe_param`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ParameterDescription {
-    /// Indicates whether the parameter may be NULL not.
+pub struct ColumnType {
+    /// Indicates whether the column or parameter may be NULL.
     pub nullability: Nullability,
-    /// The SQL Type associated with that parameter.
+    /// The SQL data type of the column or parameter.
     pub data_type: DataType,
 }
+
+/// Use [`ColumnType`] instead.
+#[deprecated(note = "Use `ColumnType` instead.")]
+pub type ParameterDescription = ColumnType;

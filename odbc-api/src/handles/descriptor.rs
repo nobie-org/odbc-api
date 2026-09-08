@@ -1,15 +1,15 @@
 use std::marker::PhantomData;
 
 use odbc_sys::{
-    CDataType, Desc, HDesc, HStmt, Handle, HandleType, Pointer, IS_POINTER, IS_SMALLINT,
+    CDataType, Desc, HDesc, HStmt, Handle, HandleType, IS_POINTER, IS_SMALLINT, Pointer,
 };
 
-use super::{sql_result::ExtSqlReturn, AsHandle, SqlResult};
+use super::{AnyHandle, SqlResult, sql_result::ExtSqlReturn};
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 use odbc_sys::SQLSetDescField as sql_set_desc_field;
 
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 use odbc_sys::SQLSetDescFieldW as sql_set_desc_field;
 
 /// A descriptor associated with a statement. This wrapper does not wrap explicitly allocated
@@ -17,16 +17,14 @@ use odbc_sys::SQLSetDescFieldW as sql_set_desc_field;
 /// associated with the statement. It could also represent an explicitly allocated one, but ony in
 /// the context there it is associated with a statement and currently borrowed from it.
 ///
-/// * IPD Implementation parameter descriptor
 /// * APD Application parameter descriptor
-/// * IRD Implemenation row descriptor
 /// * ARD Application row descriptor
 pub struct Descriptor<'stmt> {
     handle: HDesc,
     parent: PhantomData<&'stmt HStmt>,
 }
 
-impl<'stmt> Descriptor<'stmt> {
+impl Descriptor<'_> {
     /// # Safety
     ///
     /// Call this method only with a valid (successfully allocated) ODBC descriptor handle.
@@ -82,13 +80,15 @@ impl<'stmt> Descriptor<'stmt> {
     /// The buffer bound to the data pointer in ARD must match, otherwise calls to fetch might e.g.
     /// write beyond the bounds of these types, if e.g. a larger type is bound
     pub unsafe fn set_type(&mut self, rec_number: i16, c_type: CDataType) -> SqlResult<()> {
-        sql_set_desc_field(
-            self.as_sys(),
-            rec_number,
-            Desc::Type,
-            c_type as i16 as Pointer,
-            IS_SMALLINT,
-        )
+        unsafe {
+            sql_set_desc_field(
+                self.as_sys(),
+                rec_number,
+                Desc::Type,
+                c_type as i16 as Pointer,
+                IS_SMALLINT,
+            )
+        }
         .into_sql_result("SQLSetDescField")
     }
 
@@ -98,20 +98,22 @@ impl<'stmt> Descriptor<'stmt> {
     ///
     /// Pointer must be valid and match the description set using set_type.
     pub unsafe fn set_data_ptr(&mut self, rec_number: i16, data_ptr: Pointer) -> SqlResult<()> {
-        sql_set_desc_field(
-            self.as_sys(),
-            rec_number,
-            Desc::DataPtr,
-            data_ptr,
-            IS_POINTER,
-        )
+        unsafe {
+            sql_set_desc_field(
+                self.as_sys(),
+                rec_number,
+                Desc::DataPtr,
+                data_ptr,
+                IS_POINTER,
+            )
+        }
         .into_sql_result("SQLSetDescField")
     }
 }
 
-unsafe impl<'stmt> AsHandle for Descriptor<'stmt> {
+unsafe impl AnyHandle for Descriptor<'_> {
     fn as_handle(&self) -> Handle {
-        self.handle as Handle
+        self.handle.as_handle()
     }
 
     fn handle_type(&self) -> HandleType {

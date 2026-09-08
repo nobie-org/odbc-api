@@ -1,19 +1,19 @@
 use std::{mem, ops::Deref};
 
 use crate::{
+    Error, RowSetBuffer, TruncationInfo,
     buffers::Indicator,
     handles::{CDataMut, Statement, StatementRef},
-    Error, RowSetBuffer, TruncationInfo,
 };
 
-/// [`FetchRow`]s can be bound to a [`crate::Cursor`] to enable row wise (bulk) fetching of data as
-/// opposed to column wise fetching. Since all rows are bound to a C-API in a contigious block of
-/// memory the row itself should be representable as such. Concretly that means that types like
+/// [`FetchRow`]s can be bound to a [`crate::Cursor`] to enable row-wise (bulk) fetching of data as
+/// opposed to column-wise fetching. Since all rows are bound to a C-API in a contiguous block of
+/// memory the row itself should be representable as such. Concretely that means that types like
 /// `String` can not be supported directly by [`FetchRow`]s for efficient bulk fetching, due to the
 /// fact it points to data on the heap.
-/// 
-/// This trait is implement by tuples of [`FetchRowMember`]. In addition it can also be derived
-/// for structs there all members implement [`FetchRowMember`] using the `Fetch` derive macro if the
+///
+/// This trait is implemented by tuples of [`FetchRowMember`]. In addition it can also be derived
+/// for structs where all members implement [`FetchRowMember`] using the `Fetch` derive macro if the
 /// optional derive feature is activated.
 ///
 /// # Safety
@@ -21,7 +21,7 @@ use crate::{
 /// * All the bound buffers need to be valid for the lifetime of the row.
 /// * The offsets into the memory for the field representing a column, must be constant for all
 ///   types of the row. This is required to make the row suitable for fetching in bulk, as only the
-///   first row is bound explicitly, and the bindings for all consequitive rows is calculated by
+///   first row is bound explicitly, and the bindings for all consecutive rows is calculated by
 ///   taking the size of the row in bytes multiplied by buffer index.
 pub unsafe trait FetchRow: Copy {
     /// Binds the columns of the result set to members of the row.
@@ -47,7 +47,10 @@ pub unsafe trait FetchRow: Copy {
 ///     let max_rows_in_batch = 250;
 ///     type Row = (VarCharArray<255>, VarCharArray<255>);
 ///     let buffer = RowVec::<Row>::new(max_rows_in_batch);
-///     let mut cursor = conn.execute("SELECT first_name, last_name FROM Persons", ())?
+///     let query = "SELECT first_name, last_name FROM Persons";
+///     let parameters = ();
+///     let timeout_sec = None;
+///     let mut cursor = conn.execute(query, parameters, timeout_sec)?
 ///         .expect("SELECT must yield a result set");
 ///     let mut block_cursor = cursor.bind_buffer(buffer)?;
 ///
@@ -65,20 +68,22 @@ pub unsafe trait FetchRow: Copy {
 ///     Ok(())
 /// }
 /// ```
-/// 
+///
 /// To fetch rows with this buffer type `R` must implement [`FetchRow`]. This is currently
-/// implemented for tuple types. Each element of these tuples must implement [`FetchRowMember`].
-/// 
+/// implemented for tuple types. Each element of these tuples must implement [`FetchRowMember`]. You
+/// can also derive [`FetchRow`] for structs with the `Fetch` derive macro if the feature is
+/// enabled.
+///
 /// Currently supported are: `f64`, `f32`, [`odbc_sys::Date`], [`odbc_sys::Timestamp`],
-/// [`odbc_sys::Time`], `i16`, `u36`, `i32`, `u32`, `i8`, `u8`, `Bit`, `i64`, `u64` and
-/// [`crate::parameter::VarCharArray`]. Fixed sized types can be wrapped in [`crate::Nullable`].
+/// [`odbc_sys::Time`], `i16`, `u16`, `i32`, `u32`, `i8`, `u8`, `Bit`, `i64`, `u64` and
+/// [`crate::parameter::VarCharArray`]. Fixed-size types can be wrapped in [`crate::Nullable`].
 pub struct RowVec<R> {
     /// A mutable pointer to num_rows_fetched is passed to the C-API. It is used to write back the
     /// number of fetched rows. `num_rows` is heap allocated, so the pointer is not invalidated,
     /// even if the `ColumnarBuffer` instance is moved in memory.
     num_rows: Box<usize>,
-    /// Here we actually store the rows. The length of `rows` is the capacity of the `RowWiseBuffer`
-    /// instance. It must not be 0.
+    /// Here we actually store the rows. The length of `rows` is the capacity of the
+    /// `RowWiseBuffer` instance. It must not be 0.
     rows: Vec<R>,
 }
 
@@ -135,7 +140,7 @@ where
             .rows
             .first_mut()
             .expect("rows in Row Wise buffers must not be empty.");
-        first.bind_columns_to_cursor(cursor)
+        unsafe { first.bind_columns_to_cursor(cursor) }
     }
 
     fn find_truncation(&self) -> Option<TruncationInfo> {
@@ -150,10 +155,10 @@ where
 ///
 /// # Safety
 ///
-/// Must only be implemented for types completly representable by consequtive bytes. While members
-/// can bind to Variadic types the length of the type buffering them must be known at compile time.
-/// E.g. [`crate::parameter::VarCharArray`] can also bind to Variadic types but is fixed length at
-/// compile time.
+/// Must only be implemented for types completely representable by consecutive bytes. While members
+/// can bind to Variadic types, the length of the type used for buffering must be known at compile
+/// time. E.g. [`crate::parameter::VarCharArray`] can also bind to Variadic types but is fixed
+/// length at compile time.
 pub unsafe trait FetchRowMember: CDataMut + Copy {
     /// `Some` if the indicator indicates truncation. Always `None` for fixed sized types.
     fn find_truncation(&self, buffer_index: usize) -> Option<TruncationInfo> {
@@ -176,7 +181,7 @@ pub unsafe trait FetchRowMember: CDataMut + Copy {
         col_index: u16,
         cursor: &mut StatementRef<'_>,
     ) -> Result<(), Error> {
-        cursor.bind_col(col_index, self).into_result(cursor)
+        unsafe { cursor.bind_col(col_index, self).into_result(cursor) }
     }
 }
 
@@ -214,12 +219,15 @@ macro_rules! impl_fetch_row_for_tuple{
         unsafe impl<$($t:FetchRowMember,)*> FetchRow for ($($t,)*)
         {
             unsafe fn bind_columns_to_cursor(&mut self, mut cursor: StatementRef<'_>) -> Result<(), Error> {
-                let ($(ref mut $t,)*) = self;
-                impl_bind_columns_to_cursor!(1, cursor, $($t,)*)
+                let &mut ($(ref mut $t,)*) = self;
+                #[allow(unused_unsafe)] // We do not need the unsafe in case it would bind nothing.
+                unsafe {
+                    impl_bind_columns_to_cursor!(1, cursor, $($t,)*)
+                }
             }
 
             fn find_truncation(&self) -> Option<TruncationInfo> {
-                let ($(ref $t,)*) = self;
+                let &($(ref $t,)*) = self;
                 impl_find_truncation!(0, $($t,)*)
             }
         }

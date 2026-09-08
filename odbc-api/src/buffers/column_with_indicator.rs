@@ -1,8 +1,10 @@
+use super::{ColumnBuffer, Indicator, Resize, Slice};
 use crate::{
+    BoundInputSlice,
     fixed_sized::{Bit, Pod},
-    handles::{CData, CDataMut},
+    handles::{CData, CDataMut, StatementRef},
 };
-use odbc_sys::{Date, Time, Timestamp, NULL_DATA};
+use odbc_sys::{Date, NULL_DATA, Time, Timestamp};
 use std::{
     ffi::c_void,
     mem::size_of,
@@ -21,7 +23,7 @@ pub type OptI64Column = ColumnWithIndicator<i64>;
 pub type OptU8Column = ColumnWithIndicator<u8>;
 pub type OptBitColumn = ColumnWithIndicator<Bit>;
 
-/// Column buffer for fixed sized type, also binding an indicator buffer to handle NULL.
+/// Column buffer for fixed-size type, also binding an indicator buffer to handle NULL.
 #[derive(Debug)]
 pub struct ColumnWithIndicator<T> {
     values: Vec<T>,
@@ -39,37 +41,12 @@ where
         }
     }
 
-    /// Access the value at a specific row index.
-    ///
-    /// The buffer size is not automatically adjusted to the size of the last row set. It is the
-    /// callers responsibility to ensure, a value has been written to the indexed position by
-    /// [`crate::Cursor::fetch`] using the value bound to the cursor with
-    /// [`crate::Cursor::set_num_result_rows_fetched`].
-    pub fn iter(&self, num_rows: usize) -> NullableSlice<'_, T> {
-        NullableSlice {
-            indicators: &self.indicators[0..num_rows],
-            values: &self.values[0..num_rows],
-        }
-    }
-
-    /// Fills the column with NULL, between From and To
-    pub fn fill_null(&mut self, from: usize, to: usize) {
-        for index in from..to {
-            self.indicators[index] = NULL_DATA;
-        }
-    }
-
     /// Create a writer which writes to the first `n` elements of the buffer.
     pub fn writer_n(&mut self, n: usize) -> NullableSliceMut<'_, T> {
         NullableSliceMut {
             indicators: &mut self.indicators[0..n],
             values: &mut self.values[0..n],
         }
-    }
-
-    /// Maximum number elements which the column may hold.
-    pub fn capacity(&self) -> usize {
-        self.indicators.len()
     }
 }
 
@@ -121,6 +98,15 @@ impl<'a, T> NullableSlice<'a, T> {
     /// ```
     pub fn raw_values(&self) -> (&'a [T], &'a [isize]) {
         (self.values, self.indicators)
+    }
+
+    /// Access the n-th element. `None` if the indicater is `NULL_DATA`.
+    pub fn get(&self, index: usize) -> Option<&'a T> {
+        if self.indicators[index] == NULL_DATA {
+            None
+        } else {
+            Some(&self.values[index])
+        }
     }
 }
 
@@ -177,6 +163,48 @@ where
     }
 }
 
+unsafe impl<T> ColumnBuffer for ColumnWithIndicator<T>
+where
+    T: Pod,
+{
+    fn capacity(&self) -> usize {
+        self.indicators.len()
+    }
+
+    fn has_truncated_values(&self, _num_rows: usize) -> Option<Indicator> {
+        None
+    }
+}
+
+unsafe impl<T> Slice for ColumnWithIndicator<T>
+where
+    T: Pod,
+{
+    type Slice<'a> = NullableSlice<'a, T>;
+
+    fn slice(&self, valid_rows: usize) -> NullableSlice<'_, T> {
+        NullableSlice {
+            indicators: &self.indicators[0..valid_rows],
+            values: &self.values[0..valid_rows],
+        }
+    }
+}
+
+unsafe impl<'a, T> BoundInputSlice<'a> for ColumnWithIndicator<T>
+where
+    T: Pod + 'static,
+{
+    type SliceMut = NullableSliceMut<'a, T>;
+
+    unsafe fn as_view_mut(
+        &'a mut self,
+        _parameter_index: u16,
+        _stmt: StatementRef<'a>,
+    ) -> NullableSliceMut<'a, T> {
+        self.writer_n(self.capacity())
+    }
+}
+
 unsafe impl<T> CData for Vec<T>
 where
     T: Pod,
@@ -211,6 +239,21 @@ where
     }
 }
 
+unsafe impl<'a, T> BoundInputSlice<'a> for Vec<T>
+where
+    T: Pod + 'static,
+{
+    type SliceMut = &'a mut [T];
+
+    unsafe fn as_view_mut(
+        &'a mut self,
+        _parameter_index: u16,
+        _stmt: StatementRef<'a>,
+    ) -> &'a mut [T] {
+        self.as_mut_slice()
+    }
+}
+
 /// Used to fill a column buffer with an iterator. Returned by
 /// [`crate::ColumnarBulkInserter::column_mut`] as part of an [`crate::buffers::AnySliceMut`].
 #[derive(Debug)]
@@ -219,7 +262,7 @@ pub struct NullableSliceMut<'a, T> {
     values: &'a mut [T],
 }
 
-impl<'a, T> NullableSliceMut<'a, T> {
+impl<T> NullableSliceMut<'_, T> {
     /// `true` if the slice has a length of `0`.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
@@ -276,12 +319,47 @@ impl<'a, T> NullableSliceMut<'a, T> {
     }
 }
 
-impl<'a, T> NullableSliceMut<'a, T> {
+impl<T> NullableSliceMut<'_, T> {
     /// Writes the elements returned by the iterator into the buffer, starting at the beginning.
     /// Writes elements until the iterator returns `None` or the buffer can not hold more elements.
     pub fn write(&mut self, it: impl Iterator<Item = Option<T>>) {
         for (index, item) in it.enumerate().take(self.values.len()) {
             self.set_cell(index, item)
         }
+    }
+}
+
+impl<T> Resize for ColumnWithIndicator<T>
+where
+    T: Default + Clone,
+{
+    fn resize(&mut self, new_size: usize) {
+        self.values.resize(new_size, T::default());
+        self.indicators.resize(new_size, NULL_DATA);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::buffers::{Resize, Slice};
+
+    use super::ColumnWithIndicator;
+
+    #[test]
+    fn column_with_indicator_is_resize() {
+        // Given a column with indicator with two elements `1` and `2`
+        let mut column = ColumnWithIndicator::<i32>::new(2);
+        let mut writer = column.writer_n(2);
+        writer.set_cell(0, Some(1));
+        writer.set_cell(1, Some(2));
+
+        // When we resize it to 3 elements
+        column.resize(3);
+
+        // Then the first two elements are still `1` and `2`, and the third is NULL
+        let slice = column.slice(3);
+        assert_eq!(slice.get(0), Some(&1));
+        assert_eq!(slice.get(1), Some(&2));
+        assert_eq!(slice.get(2), None);
     }
 }

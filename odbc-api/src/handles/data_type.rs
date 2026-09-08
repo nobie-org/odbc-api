@@ -2,6 +2,14 @@ use std::num::NonZeroUsize;
 
 use odbc_sys::SqlDataType;
 
+/// For Microsoft SQL Server, but also for Oracle there exists a maximum string length of 4000 for
+/// `NVARCHAR` SQL type.
+pub(crate) const ASSUMED_MAX_LENGTH_OF_W_VARCHAR: usize = 4000;
+
+/// For Microsoft SQL Server there exists a maximum string length of 8000 for `VARCHAR` SQL type.
+/// Longer strings require `VARCHAR(MAX)` which maps to `LongVarchar`.
+pub(crate) const ASSUMED_MAX_LENGTH_OF_VARCHAR: usize = 8000;
+
 /// The relational type of the column. Think of it as the type used in the `CREATE TABLE` statement
 /// then creating the database.
 ///
@@ -59,8 +67,9 @@ pub enum DataType {
     Double,
     /// `Varchar(n)`. Variable length character string.
     Varchar {
-        /// Maximum length of the character string (excluding terminating zero). Whether this length
-        /// is to be interpreted as bytes or Codepoints is ambigious and depends on the datasource.
+        /// Maximum length of the character string (excluding terminating zero). Whether this
+        /// length is to be interpreted as bytes or Codepoints is ambigious and depends on
+        /// the datasource.
         ///
         /// E.g. For Microsoft SQL Server this is the binary length, theras for a MariaDB this
         /// refers to codepoints in case of UTF-8 encoding. If you need the binary size query the
@@ -83,6 +92,13 @@ pub enum DataType {
         /// depends on the capabilities of the driver and datasource. E.g. its 2^31 - 1 for MSSQL.
         length: Option<NonZeroUsize>,
     },
+    /// `NVARCHAR(MAX)`. Variable length characeter string for long text objects. Indicates the use
+    /// of wide character strings and the use of UCS2 encoding on the side of the database.
+    WLongVarchar {
+        /// Maximum length of the character string (excluding terminating zero). Maximum size
+        /// depends on the capabilities of the driver and datasource. E.g. its 2^31 - 1 for MSSQL.
+        length: Option<NonZeroUsize>,
+    },
     /// `BLOB`. Variable length data for long binary objects.
     LongVarbinary {
         /// Maximum length of the binary data. Maximum size depends on the capabilities of the
@@ -96,16 +112,16 @@ pub enum DataType {
     /// indicates the seconds precision.
     Time {
         /// Number of radix ten digits used to represent the timestamp after the decimal points.
-        /// E.g. Milliseconds would be represented by precision 3, Microseconds by 6 and Nanoseconds
-        /// by 9.
+        /// E.g. Milliseconds would be represented by precision 3, Microseconds by 6 and
+        /// Nanoseconds by 9.
         precision: i16,
     },
     /// `Timestamp`. Year, month, day, hour, minute, and second fields, with valid values as
     /// defined for the Date and Time variants.
     Timestamp {
         /// Number of radix ten digits used to represent the timestamp after the decimal points.
-        /// E.g. Milliseconds would be represented by precision 3, Microseconds by 6 and Nanoseconds
-        /// by 9.
+        /// E.g. Milliseconds would be represented by precision 3, Microseconds by 6 and
+        /// Nanoseconds by 9.
         precision: i16,
     },
     /// `BIGINT`. Exact numeric value with precision 19 (if signed) or 20 (if unsigned) and scale 0
@@ -127,10 +143,11 @@ pub enum DataType {
     Other {
         /// Type of the column
         data_type: SqlDataType,
-        /// Size of column element
+        /// Size of column element. This is the size used to bind the data type as a paramater.
         column_size: Option<NonZeroUsize>,
         /// Decimal digits returned for the column element. Exact meaning if any depends on the
-        /// `data_type` field.
+        /// `data_type` field. Like `column_size` this is used then using the [`DataType`] to bind
+        /// data as a parameter.
         decimal_digits: i16,
     },
 }
@@ -142,6 +159,9 @@ impl DataType {
         match data_type {
             SqlDataType::UNKNOWN_TYPE => DataType::Unknown,
             SqlDataType::EXT_LONG_VARCHAR => DataType::LongVarchar {
+                length: NonZeroUsize::new(column_size),
+            },
+            SqlDataType::EXT_W_LONG_VARCHAR => DataType::WLongVarchar {
                 length: NonZeroUsize::new(column_size),
             },
             SqlDataType::EXT_BINARY => DataType::Binary {
@@ -198,7 +218,7 @@ impl DataType {
         }
     }
 
-    /// The associated `data_type` discriminator for this variant.
+    /// The associated consicse SQL `data_type` discriminator for this variant.
     pub fn data_type(&self) -> SqlDataType {
         match self {
             DataType::Unknown => SqlDataType::UNKNOWN_TYPE,
@@ -215,6 +235,7 @@ impl DataType {
             DataType::Double => SqlDataType::DOUBLE,
             DataType::Varchar { .. } => SqlDataType::VARCHAR,
             DataType::LongVarchar { .. } => SqlDataType::EXT_LONG_VARCHAR,
+            DataType::WLongVarchar { .. } => SqlDataType::EXT_W_LONG_VARCHAR,
             DataType::Date => SqlDataType::DATE,
             DataType::Time { .. } => SqlDataType::TIME,
             DataType::Timestamp { .. } => SqlDataType::TIMESTAMP,
@@ -250,6 +271,7 @@ impl DataType {
             | DataType::Binary { length }
             | DataType::WChar { length }
             | DataType::WVarchar { length }
+            | DataType::WLongVarchar { length }
             | DataType::LongVarchar { length } => *length,
             DataType::Float { precision, .. }
             | DataType::Numeric { precision, .. }
@@ -274,6 +296,7 @@ impl DataType {
             | DataType::Varbinary { .. }
             | DataType::LongVarbinary { .. }
             | DataType::Binary { .. }
+            | DataType::WLongVarchar { .. }
             | DataType::LongVarchar { .. }
             | DataType::Date
             | DataType::BigInt
@@ -308,6 +331,7 @@ impl DataType {
             | DataType::WVarchar { length }
             | DataType::WChar { length }
             | DataType::Char { length }
+            | DataType::WLongVarchar { length }
             | DataType::LongVarchar { length } => *length,
             // The precision of the column plus 2 (a sign, precision digits, and a decimal point).
             // For example, the display size of a column defined as NUMERIC(10,3) is 12.
@@ -368,6 +392,8 @@ impl DataType {
     /// assert_eq!(DataType::Char { length: nz(10) }.utf8_len(), nz(40));
     /// assert_eq!(DataType::WVarchar { length: nz(10) }.utf8_len(), nz(40));
     /// assert_eq!(DataType::WChar { length: nz(10) }.utf8_len(), nz(40));
+    /// assert_eq!(DataType::LongVarchar { length: nz(10) }.utf8_len(), nz(40));
+    /// assert_eq!(DataType::WLongVarchar { length: nz(10) }.utf8_len(), nz(40));
     /// // For other types return value is identical to display size as they are assumed to be
     /// // entirely representable with ASCII characters.
     /// assert_eq!(DataType::Numeric { precision: 10, scale: 3}.utf8_len(), nz(10 + 2));
@@ -377,8 +403,12 @@ impl DataType {
             // One character may need up to four bytes to be represented in utf-8.
             DataType::Varchar { length }
             | DataType::WVarchar { length }
+            | DataType::Char { length }
             | DataType::WChar { length }
-            | DataType::Char { length } => length.map(|l| l.get() * 4).and_then(NonZeroUsize::new),
+            | DataType::LongVarchar { length }
+            | DataType::WLongVarchar { length } => {
+                length.map(|l| l.get() * 4).and_then(NonZeroUsize::new)
+            }
             other => other.display_size(),
         }
     }
@@ -396,6 +426,8 @@ impl DataType {
     /// assert_eq!(DataType::Char { length: nz(10) }.utf16_len(), nz(20));
     /// assert_eq!(DataType::WVarchar { length: nz(10) }.utf16_len(), nz(20));
     /// assert_eq!(DataType::WChar { length: nz(10) }.utf16_len(), nz(20));
+    /// assert_eq!(DataType::LongVarchar { length: nz(10) }.utf16_len(), nz(20));
+    /// assert_eq!(DataType::WLongVarchar { length: nz(10) }.utf16_len(), nz(20));
     /// // For other types return value is identical to display size as they are assumed to be
     /// // entirely representable with ASCII characters.
     /// assert_eq!(DataType::Numeric { precision: 10, scale: 3}.utf16_len(), nz(10 + 2));
@@ -406,7 +438,11 @@ impl DataType {
             DataType::Varchar { length }
             | DataType::WVarchar { length }
             | DataType::WChar { length }
-            | DataType::Char { length } => length.map(|l| l.get() * 2).and_then(NonZeroUsize::new),
+            | DataType::Char { length }
+            | DataType::LongVarchar { length }
+            | DataType::WLongVarchar { length } => {
+                length.map(|l| l.get() * 2).and_then(NonZeroUsize::new)
+            }
             other => other.display_size(),
         }
     }

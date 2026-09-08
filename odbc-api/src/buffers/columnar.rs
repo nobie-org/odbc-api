@@ -1,17 +1,17 @@
 use std::{
     collections::HashSet,
     num::NonZeroUsize,
-    str::{from_utf8, Utf8Error},
+    str::{Utf8Error, from_utf8},
 };
 
 use crate::{
+    Error, ResultSetMetadata, RowSetBuffer,
     columnar_bulk_inserter::BoundInputSlice,
     cursor::TruncationInfo,
     fixed_sized::Pod,
     handles::{CDataMut, Statement, StatementRef},
     parameter::WithDataType,
     result_set_metadata::utf8_display_sizes,
-    Error, ResultSetMetadata, RowSetBuffer,
 };
 
 use super::{Indicator, TextColumn};
@@ -66,7 +66,9 @@ impl<C: ColumnBuffer> ColumnarBuffer<C> {
     pub fn num_cols(&self) -> usize {
         self.columns.len()
     }
+}
 
+impl<C: Slice> ColumnarBuffer<C> {
     /// Use this method to gain read access to the actual column data.
     ///
     /// # Parameters
@@ -77,8 +79,8 @@ impl<C: ColumnBuffer> ColumnarBuffer<C> {
     ///   columns may simply be ignored. That being said, if every column of the output is bound in
     ///   the buffer, in the same order in which they are enumerated in the result set, the
     ///   relationship between column index and buffer index is `buffer_index = column_index - 1`.
-    pub fn column(&self, buffer_index: usize) -> C::View<'_> {
-        self.columns[buffer_index].1.view(*self.num_rows)
+    pub fn column(&self, buffer_index: usize) -> C::Slice<'_> {
+        self.columns[buffer_index].1.slice(*self.num_rows)
     }
 }
 
@@ -99,8 +101,10 @@ where
     }
 
     unsafe fn bind_colmuns_to_cursor(&mut self, mut cursor: StatementRef<'_>) -> Result<(), Error> {
-        for (col_number, column) in &mut self.columns {
-            cursor.bind_col(*col_number, column).into_result(&cursor)?;
+        unsafe {
+            for (col_number, column) in &mut self.columns {
+                cursor.bind_col(*col_number, column).into_result(&cursor)?;
+            }
         }
         Ok(())
     }
@@ -123,19 +127,19 @@ where
 /// A columnar buffer intended to be bound with [crate::Cursor::bind_buffer] in order to obtain
 /// results from a cursor.
 ///
-/// Binds to the result set column wise. This is usually helpful in dataengineering or data sciense
-/// tasks. This buffer type can be used in situations there the schema of the queried data is known
-/// at compile time, as well as for generic applications which do work with wide range of different
+/// Binds to the result set column-wise. This is usually helpful in data engineering or data science
+/// tasks. This buffer type can be used in situations where the schema of the queried data is known
+/// at compile time, as well as for generic applications which work with a wide range of different
 /// data.
 ///
-/// # Example: Fetching results column wise with `ColumnarBuffer`.
+/// # Example: Fetching results column wise with `ColumnarDynBuffer`.
 ///
 /// Consider querying a table with two columns `year` and `name`.
 ///
 /// ```no_run
 /// use odbc_api::{
 ///     Environment, Cursor, ConnectionOptions,
-///     buffers::{AnySlice, BufferDesc, Item, ColumnarAnyBuffer},
+///     buffers::{BufferDesc, Item, ColumnarDynBuffer},
 /// };
 ///
 /// let env = Environment::new()?;
@@ -149,13 +153,16 @@ where
 /// ];
 ///
 /// /// Creates a columnar buffer fitting the buffer description with the capacity of `batch_size`.
-/// let mut buffer = ColumnarAnyBuffer::from_descs(batch_size, buffer_description);
+/// let mut buffer = ColumnarDynBuffer::from_descs(batch_size, buffer_description);
 ///
 /// let mut conn = env.connect(
 ///     "YourDatabase", "SA", "My@Test@Password1",
 ///     ConnectionOptions::default(),
 /// )?;
-/// if let Some(cursor) = conn.execute("SELECT year, name FROM Birthdays;", ())? {
+/// let query = "SELECT year, name FROM Birthdays;";
+/// let params = ();
+/// let timeout_sec = None;
+/// if let Some(cursor) = conn.execute(query, params, timeout_sec)? {
 ///     // Bind buffer to cursor. We bind the buffer as a mutable reference here, which makes it
 ///     // easier to reuse for other queries, but we could have taken ownership.
 ///     let mut row_set_cursor = cursor.bind_buffer(&mut buffer)?;
@@ -163,7 +170,8 @@ where
 ///     while let Some(row_set) = row_set_cursor.fetch()? {
 ///         // Process years in row set
 ///         let year_col = row_set.column(0);
-///         for year in i16::as_nullable_slice(year_col)
+///         for year in year_col
+///             .as_nullable_slice::<i16>()
 ///             .expect("Year column buffer expected to be nullable Int")
 ///         {
 ///             // Iterate over `Option<i16>` with it ..
@@ -171,7 +179,7 @@ where
 ///         // Process names in row set
 ///         let name_col = row_set.column(1);
 ///         for name in name_col
-///             .as_text_view()
+///             .as_text()
 ///             .expect("Name column buffer expected to be text")
 ///             .iter()
 ///         {
@@ -182,22 +190,25 @@ where
 /// # Ok::<(), odbc_api::Error>(())
 /// ```
 ///
-/// This second examples changes two things, we do not know the schema in advance and use the
-/// SQL DataType to determine the best fit for the buffers. Also we want to do everything in a
+/// This second example changes two things: we do not know the schema in advance and use the
+/// SQL DataType to determine the best fit for the buffers. Also, we want to do everything in a
 /// function and return a `Cursor` with an already bound buffer. This approach is best if you have
-/// few and very long query, so the overhead of allocating buffers is negligible and you want to
+/// few and very long queries, so the overhead of allocating buffers is negligible and you want to
 /// have an easier time with the borrow checker.
 ///
 /// ```no_run
 /// use odbc_api::{
 ///     Connection, BlockCursor, Error, Cursor, Nullability, ResultSetMetadata,
-///     buffers::{ AnyBuffer, BufferDesc, ColumnarAnyBuffer, ColumnarBuffer }
+///     buffers::{ BufferDesc, ColumnarDynBuffer }
 /// };
 ///
 /// fn get_birthdays<'a>(conn: &'a mut Connection)
-///     -> Result<BlockCursor<impl Cursor + 'a, ColumnarAnyBuffer>, Error>
+///     -> Result<BlockCursor<impl Cursor + 'a, ColumnarDynBuffer>, Error>
 /// {
-///     let mut cursor = conn.execute("SELECT year, name FROM Birthdays;", ())?.unwrap();
+///     let query = "SELECT year, name FROM Birthdays;";
+///     let params = ();
+///     let timeout_sec = None;
+///     let mut cursor = conn.execute(query, params, timeout_sec)?.unwrap();
 ///     let mut column_description = Default::default();
 ///     let buffer_description : Vec<_> = (0..cursor.num_result_cols()?).map(|index| {
 ///         cursor.describe_col(index as u16 + 1, &mut column_description)?;
@@ -213,7 +224,7 @@ where
 ///     }).collect::<Result<_, Error>>()?;
 ///
 ///     // Row set size of 5000 rows.
-///     let buffer = ColumnarAnyBuffer::from_descs(5000, buffer_description);
+///     let buffer = ColumnarDynBuffer::from_descs(5000, buffer_description);
 ///     // Bind buffer and take ownership over it.
 ///     cursor.bind_buffer(buffer)
 /// }
@@ -229,15 +240,20 @@ pub struct ColumnarBuffer<C> {
     columns: Vec<(u16, C)>,
 }
 
-/// A buffer for a single column intended to be used together with [`ColumnarBuffer`].
+/// Access a safe view of the column buffer.
+///
+/// After a fetch operation buffers may only partially be filled with data, the rest of the buffer
+/// may contain uninitialized values. Also we must not permit any operation which would invalidate
+/// the addresses of the buffer. To make reading buffer contents after a fetch safe,
+/// [`ColumnBuffer`]s implement this trait to offer safe views.
 ///
 /// # Safety
 ///
-/// Views must not allow access to unintialized / invalid rows.
-pub unsafe trait ColumnBuffer: CDataMut {
+/// Views must not allow access to uninitialized / invalid rows.
+pub unsafe trait Slice {
     /// Immutable view on the column data. Used in safe abstractions. User must not be able to
     /// access uninitialized or invalid memory of the buffer through this interface.
-    type View<'a>
+    type Slice<'a>
     where
         Self: 'a;
 
@@ -245,11 +261,20 @@ pub unsafe trait ColumnBuffer: CDataMut {
     /// column buffer does not know how many elements were in the last row group, and therefore can
     /// not guarantee the accessed element to be valid and in a defined state. It also can not panic
     /// on accessing an undefined element.
-    fn view(&self, valid_rows: usize) -> Self::View<'_>;
+    fn slice(&self, valid_rows: usize) -> Self::Slice<'_>;
+}
 
-    /// Fills the column with the default representation of values, between `from` and `to` index.
-    fn fill_default(&mut self, from: usize, to: usize);
-
+/// A buffer for a single column intended to be used together with [`ColumnarBuffer`].
+///
+/// # Safety
+///
+/// Implementations must ensure that:
+///
+/// * Capacity must be correctly reported otherwise data may be written outside its bounds.
+/// * truncation must be correctly reported. Code which reuses the same column buffer for reading
+///   and inserting may rely on this in order to avoid passing values indicators of truncated values
+///   in bulk insertions. This could lead to out of bounds memory access.
+pub unsafe trait ColumnBuffer: CDataMut {
     /// Current capacity of the column
     fn capacity(&self) -> usize;
 
@@ -261,20 +286,24 @@ pub unsafe trait ColumnBuffer: CDataMut {
     fn has_truncated_values(&self, num_rows: usize) -> Option<Indicator>;
 }
 
+unsafe impl<T> Slice for WithDataType<T>
+where
+    T: Slice,
+{
+    type Slice<'a>
+        = T::Slice<'a>
+    where
+        T: 'a;
+
+    fn slice(&self, valid_rows: usize) -> T::Slice<'_> {
+        self.value.slice(valid_rows)
+    }
+}
+
 unsafe impl<T> ColumnBuffer for WithDataType<T>
 where
     T: ColumnBuffer,
 {
-    type View<'a> = T::View<'a> where T: 'a;
-
-    fn view(&self, valid_rows: usize) -> T::View<'_> {
-        self.value.view(valid_rows)
-    }
-
-    fn fill_default(&mut self, from: usize, to: usize) {
-        self.value.fill_default(from, to)
-    }
-
     fn capacity(&self) -> usize {
         self.value.capacity()
     }
@@ -295,7 +324,7 @@ where
         parameter_index: u16,
         stmt: StatementRef<'a>,
     ) -> Self::SliceMut {
-        self.value.as_view_mut(parameter_index, stmt)
+        unsafe { self.value.as_view_mut(parameter_index, stmt) }
     }
 }
 
@@ -305,7 +334,7 @@ where
 /// # Example
 ///
 /// ```no_run
-/// //! A program executing a query and printing the result as csv to standard out. Requires
+/// //! A program executing a query and printing the result as CSV to standard output. Requires
 /// //! `anyhow` and `csv` crate.
 ///
 /// use anyhow::Error;
@@ -337,11 +366,14 @@ where
 ///         ConnectionOptions::default(),
 ///     )?;
 ///
-///     // Execute a one of query without any parameters.
-///     match connection.execute("SELECT * FROM TableName", ())? {
+///     // Execute a one-off query without any parameters.
+///     let query = "SELECT * FROM TableName";
+///     let params = ();
+///     let timeout_sec = None;
+///     match connection.execute(query, params, timeout_sec)? {
 ///         Some(mut cursor) => {
 ///             // Write the column names to stdout
-///             let mut headline : Vec<String> = cursor.column_names()?.collect::<Result<_,_>>()?;
+///             let mut headline: Vec<String> = cursor.column_names()?.collect::<Result<_,_>>()?;
 ///             writer.write_record(headline)?;
 ///
 ///             // Use schema in cursor to initialize a text buffer large enough to hold the largest
@@ -360,7 +392,7 @@ where
 ///                             .at(col_index, row_index)
 ///                             .unwrap_or(&[])
 ///                     });
-///                     // Writes row as csv
+///                     // Writes the row as CSV
 ///                     writer.write_record(record)?;
 ///                 }
 ///             }
@@ -431,7 +463,7 @@ impl TextRowSet {
                     })?
                 };
 
-                Ok((col_index, buffer))
+                Ok::<_, Error>((col_index, buffer))
             })
             .collect::<Result<_, _>>()?;
         Ok(TextRowSet {
@@ -451,7 +483,7 @@ impl TextRowSet {
             .into_iter()
             .enumerate()
             .map(|(index, max_str_len)| {
-                Ok((
+                Ok::<_, Error>((
                     (index + 1).try_into().unwrap(),
                     TextColumn::try_new(row_capacity, max_str_len)
                         .map_err(|source| source.add_context(index.try_into().unwrap()))?,
@@ -512,18 +544,6 @@ unsafe impl<T> ColumnBuffer for Vec<T>
 where
     T: Pod,
 {
-    type View<'a> = &'a [T];
-
-    fn view(&self, valid_rows: usize) -> &[T] {
-        &self[..valid_rows]
-    }
-
-    fn fill_default(&mut self, from: usize, to: usize) {
-        for item in &mut self[from..to] {
-            *item = Default::default();
-        }
-    }
-
     fn capacity(&self) -> usize {
         self.len()
     }
@@ -533,15 +553,74 @@ where
     }
 }
 
+unsafe impl<T> Slice for Vec<T>
+where
+    T: Pod,
+{
+    type Slice<'a> = &'a [T];
+
+    fn slice(&self, valid_rows: usize) -> &[T] {
+        &self[..valid_rows]
+    }
+}
+
+/// A column buffer which can be resized.
+///
+/// Resizing is useful if a column buffer is used for inserting parameters, rather than fetching.
+/// Imagine an application which inserts data from a stream with row groups of varying size. If it
+/// encounters a row group with a new maximum size, it may want to resize the parameter buffers to
+/// send the entire row group in one go.
+pub trait Resize {
+    /// Resize the buffer to the given capacity.
+    ///
+    /// # Parameters
+    ///
+    /// * `new_capacity`: The new capacity of the buffer.
+    fn resize(&mut self, new_capacity: usize);
+}
+
+impl<T> Resize for Vec<T>
+where
+    T: Default + Clone,
+{
+    fn resize(&mut self, new_capacity: usize) {
+        Vec::resize(self, new_capacity, T::default());
+    }
+}
+
+impl<T> Resize for WithDataType<T>
+where
+    T: Resize,
+{
+    fn resize(&mut self, new_capacity: usize) {
+        self.value.resize(new_capacity);
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
-    use crate::buffers::{BufferDesc, ColumnarAnyBuffer};
+    use super::Resize;
+    use crate::buffers::{BufferDesc, ColumnarDynBuffer};
 
     #[test]
     #[should_panic(expected = "Column indices must be unique.")]
     fn assert_unique_column_indices() {
         let bd = BufferDesc::I32 { nullable: false };
-        ColumnarAnyBuffer::from_descs_and_indices(1, [(1, bd), (2, bd), (1, bd)].iter().cloned());
+        ColumnarDynBuffer::from_descs_and_indices(1, [(1, bd), (2, bd), (1, bd)].iter().cloned());
+    }
+
+    /// Vec's can resize just fine without this library, yet it is important that they implement the
+    /// `Resize` trait, so that other generic types know about it.
+    #[test]
+    fn vec_is_resize() {
+        let mut my_int_column_buffer = vec![1, 2];
+
+        Resize::resize(&mut my_int_column_buffer, 4);
+
+        assert_eq!(my_int_column_buffer[0], 1);
+        assert_eq!(my_int_column_buffer[1], 2);
+        assert_eq!(my_int_column_buffer[2], 0);
+        assert_eq!(my_int_column_buffer[3], 0);
     }
 }

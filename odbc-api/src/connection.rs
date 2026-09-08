@@ -1,17 +1,24 @@
 use crate::{
+    BlockCursorIterator, ColumnsRow, CursorImpl, CursorPolling, Error, ForeignKeysRow, OwnedCursor,
+    ParameterCollectionRef, Preallocated, Prepared, PrimaryKeysRow, Sleep, TablesRow,
     buffers::BufferDesc,
-    execute::{
-        execute_columns, execute_foreign_keys, execute_tables, execute_with_parameters,
-        execute_with_parameters_polling,
+    execute::execute_with_parameters_polling,
+    handles::{
+        self, SqlText, State, Statement, StatementConnection, StatementImpl, StatementParent,
+        slice_to_utf8,
     },
-    handles::{self, slice_to_utf8, SqlText, State, Statement, StatementImpl},
-    statement_connection::StatementConnection,
-    CursorImpl, CursorPolling, Error, ParameterCollectionRef, Preallocated, Prepared, Sleep,
 };
-use odbc_sys::HDbc;
-use std::{borrow::Cow, mem::ManuallyDrop, str, thread::panicking};
+use log::error;
+use std::{
+    borrow::Cow,
+    fmt::{self, Debug, Display},
+    mem::{ManuallyDrop, MaybeUninit},
+    ptr, str,
+    sync::Arc,
+    thread::panicking,
+};
 
-impl<'conn> Drop for Connection<'conn> {
+impl Drop for Connection<'_> {
     fn drop(&mut self) {
         match self.connection.disconnect().into_result(&self.connection) {
             Ok(()) => (),
@@ -21,21 +28,31 @@ impl<'conn> Drop for Connection<'conn> {
             }) if record.state == State::INVALID_STATE_TRANSACTION => {
                 // Invalid transaction state. Let's rollback the current transaction and try again.
                 if let Err(e) = self.rollback() {
-                    // Avoid panicking, if we already have a panic. We don't want to mask the original
-                    // error.
-                    if !panicking() {
-                        panic!(
-                            "Unexpected error rolling back transaction (In order to recover from \
-                                invalid transaction state during disconnect): {e:?}"
-                        )
-                    }
+                    // Connection might be in a suspended state. See documentation about suspended
+                    // state here:
+                    // <https://learn.microsoft.com/sql/odbc/reference/syntax/sqlendtran-function>
+                    //
+                    // See also issue:
+                    // <https://github.com/pacman82/odbc-api/issues/574#issuecomment-2286449125>
+
+                    #[cfg(not(feature = "structured_logging"))]
+                    error!(
+                        "Error rolling back transaction (in order to recover from invalid \
+                        transaction state during disconnect): {e}"
+                    );
+                    #[cfg(feature = "structured_logging")]
+                    error!(
+                        target: "odbc_api",
+                        error:err = e;
+                        "Failed rollback on disconnect"
+                    );
                 }
-                // Transaction is rolled back. Now let's try again to disconnect.
+                // Transaction might be rolled back or suspended. Now let's try again to disconnect.
                 if let Err(e) = self.connection.disconnect().into_result(&self.connection) {
-                    // Avoid panicking, if we already have a panic. We don't want to mask the original
-                    // error.
+                    // Avoid panicking, if we already have a panic. We don't want to mask the
+                    // original error.
                     if !panicking() {
-                        panic!("Unexpected error disconnecting): {e:?}")
+                        panic!("Unexpected error disconnecting (after rollback attempt): {e:?}")
                     }
                 }
             }
@@ -55,6 +72,12 @@ impl<'conn> Drop for Connection<'conn> {
 ///
 /// If you want to enable the connection pooling support build into the ODBC driver manager have a
 /// look at [`crate::Environment::set_connection_pooling`].
+///
+/// In order to create multiple statements with the same connection and for other use cases,
+/// operations like [`Self::execute`] or [`Self::prepare`] are taking a shared reference of `self`
+/// rather than `&mut self`. However, since error handling is done through state changes of the
+/// underlying connection managed by the ODBC driver, this implies that `Connection` must not be
+/// `Sync`.
 pub struct Connection<'c> {
     connection: handles::Connection<'c>,
 }
@@ -62,12 +85,6 @@ pub struct Connection<'c> {
 impl<'c> Connection<'c> {
     pub(crate) fn new(connection: handles::Connection<'c>) -> Self {
         Self { connection }
-    }
-
-    /// Transfers ownership of the handle to this open connection to the raw ODBC pointer.
-    pub fn into_sys(self) -> HDbc {
-        // We do not want to run the drop handler, but transfer ownership instead.
-        ManuallyDrop::new(self).connection.as_sys()
     }
 
     /// Transfer ownership of this open connection to a wrapper around the raw ODBC pointer. The
@@ -78,11 +95,19 @@ impl<'c> Connection<'c> {
     /// but, in case it is not, this may help you to break out of the type structure which might be
     /// to rigid for you, while simultaneously abondoning its safeguards.
     pub fn into_handle(self) -> handles::Connection<'c> {
-        unsafe { handles::Connection::new(ManuallyDrop::new(self).connection.as_sys()) }
+        // We do not want the compiler to invoke `Drop`, since drop would disconnect, yet we want to
+        // transfer ownership to the connection handle.
+        let dont_drop_me = MaybeUninit::new(self);
+        let self_ptr = dont_drop_me.as_ptr();
+
+        // Safety: We know `dont_drop_me` is (still) valid at this point so reading the ptr is okay
+        unsafe { ptr::read(&(*self_ptr).connection) }
     }
 
     /// Executes an SQL statement. This is the fastest way to submit an SQL statement for one-time
-    /// execution.
+    /// execution. In case you do **not** want to execute more statements on this connection, you
+    /// may want to use [`Self::into_cursor`] instead, which would create a cursor taking ownership
+    /// of the connection.
     ///
     /// # Parameters
     ///
@@ -90,6 +115,20 @@ impl<'c> Connection<'c> {
     /// * `params`: `?` may be used as a placeholder in the statement text. You can use `()` to
     ///   represent no parameters. See the [`crate::parameter`] module level documentation for more
     ///   information on how to pass parameters.
+    /// * `query_timeout_sec`: Use this to limit the time the query is allowed to take, before
+    ///   responding with data to the application. The driver may replace the number of seconds you
+    ///   provide with a minimum or maximum value.
+    ///
+    ///   For the timeout to work the driver must support this feature. E.g. PostgreSQL, and
+    ///   Microsoft SQL Server do, but SQLite or MariaDB do not.
+    ///
+    ///   You can specify ``0``, to deactivate the timeout, this is the default. So if you want no
+    ///   timeout, just leave it at `None`. Only reason to specify ``0`` is if for some reason your
+    ///   datasource does not have ``0`` as default.
+    ///
+    ///   This corresponds to `SQL_ATTR_QUERY_TIMEOUT` in the ODBC C API.
+    ///
+    ///   See: <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetstmtattr-function>
     ///
     /// # Return
     ///
@@ -108,8 +147,15 @@ impl<'c> Connection<'c> {
     ///     "YourDatabase", "SA", "My@Test@Password1",
     ///     ConnectionOptions::default()
     /// )?;
-    /// if let Some(cursor) = conn.execute("SELECT year, name FROM Birthdays;", ())? {
-    ///     // Use cursor to process query results.  
+    /// // This query does not use any parameters.
+    /// let query_params = ();
+    /// let timeout_sec = None;
+    /// if let Some(cursor) = conn.execute(
+    ///     "SELECT year, name FROM Birthdays;",
+    ///     query_params,
+    ///     timeout_sec)?
+    /// {
+    ///     // Use cursor to process query results.
     /// }
     /// # Ok::<(), odbc_api::Error>(())
     /// ```
@@ -117,16 +163,29 @@ impl<'c> Connection<'c> {
         &self,
         query: &str,
         params: impl ParameterCollectionRef,
+        query_timeout_sec: Option<usize>,
     ) -> Result<Option<CursorImpl<StatementImpl<'_>>>, Error> {
-        let query = SqlText::new(query);
-        let lazy_statement = move || self.allocate_statement();
-        execute_with_parameters(lazy_statement, Some(&query), params)
+        // Only allocate the statement, if we know we are going to execute something.
+        if params.parameter_set_size() == 0 {
+            return Ok(None);
+        }
+        let mut statement = self.preallocate()?;
+        if let Some(seconds) = query_timeout_sec {
+            statement.set_query_timeout_sec(seconds)?;
+        }
+        statement.into_cursor(query, params)
     }
 
-    /// Asynchronous sibling of [`Self::execute`]. Uses polling mode to be asynchronous. `sleep`
-    /// does govern the behaviour of polling, by waiting for the future in between polling. Sleep
-    /// should not be implemented using a sleep which blocks the system thread, but rather utilize
-    /// the methods provided by your async runtime. E.g.:
+    /// Executes an SQL statement asynchronously using polling mode. ⚠️**Attention**⚠️: Please read
+    /// [Asynchronous execution using polling
+    /// mode](crate::guide#asynchronous-execution-using-polling-mode) before using this
+    /// functions.
+    ///
+    /// Asynchronous sibling of [`Self::execute`]. Each time the driver returns control to your
+    /// application the future returned by `sleep` is awaited, before the driver is polled again.
+    /// This avoids a busy loop. `sleep` is a synchronous factor for a future which is awaited.
+    /// `sleep` should not be implemented using a sleep which blocks the system thread, but rather
+    /// use methods provided by your asynchronous runtime. E.g.:
     ///
     /// ```
     /// use odbc_api::{Connection, IntoParameter, Error};
@@ -146,55 +205,102 @@ impl<'c> Connection<'c> {
     ///     Ok(())
     /// }
     /// ```
+    ///
+    /// **Attention**: This feature requires driver support, otherwise the calls will just block
+    /// until they are finished. At the time of writing this out of Microsoft SQL Server,
+    /// PostgerSQL, SQLite and MariaDB this worked only with Microsoft SQL Server. For code generic
+    /// over every driver you may still use this. The functions will return with the correct results
+    /// just be aware that may block until they are finished.
+    ///
+    /// This uses the ODBC polling mode under the hood. See:
+    /// <https://learn.microsoft.com/sql/odbc/reference/develop-app/asynchronous-execution-polling-method>
     pub async fn execute_polling(
         &self,
         query: &str,
         params: impl ParameterCollectionRef,
         sleep: impl Sleep,
     ) -> Result<Option<CursorPolling<StatementImpl<'_>>>, Error> {
+        // Only allocate the statement, if we know we are going to execute something.
+        if params.parameter_set_size() == 0 {
+            return Ok(None);
+        }
         let query = SqlText::new(query);
-        let lazy_statement = move || self.allocate_statement();
-        execute_with_parameters_polling(lazy_statement, Some(&query), params, sleep).await
+        let mut statement = self.allocate_statement()?;
+        statement.set_async_enable(true).into_result(&statement)?;
+        execute_with_parameters_polling(statement, Some(&query), params, sleep).await
     }
 
-    /// In some use cases there you only execute a single statement, or the time to open a
-    /// connection does not matter users may wish to choose to not keep a connection alive seperatly
-    /// from the cursor, in order to have an easier time with the borrow checker.
+    /// Similar to [`Self::execute`], but takes ownership of the connection. This is useful if e.g.
+    /// youwant to open a connection and execute a query in a function and return a self containing
+    /// cursor.
+    ///
+    /// # Parameters
+    ///
+    /// * `query`: The text representation of the SQL statement. E.g. "SELECT * FROM my_table;".
+    /// * `params`: `?` may be used as a placeholder in the statement text. You can use `()` to
+    ///   represent no parameters. See the [`crate::parameter`] module level documentation for more
+    ///   information on how to pass parameters.
+    /// * `query_timeout_sec`: Use this to limit the time the query is allowed to take, before
+    ///   responding with data to the application. The driver may replace the number of seconds you
+    ///   provide with a minimum or maximum value.
+    ///
+    ///   For the timeout to work the driver must support this feature. E.g. PostgreSQL, and
+    ///   Microsoft SQL Server do, but SQLite or MariaDB do not.
+    ///
+    ///   You can specify ``0``, to deactivate the timeout, this is the default. So if you want no
+    ///   timeout, just leave it at `None`. Only reason to specify ``0`` is if for some reason your
+    ///   datasource does not have ``0`` as default.
+    ///
+    ///   This corresponds to `SQL_ATTR_QUERY_TIMEOUT` in the ODBC C API.
+    ///
+    ///   See: <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetstmtattr-function>
     ///
     /// ```no_run
-    /// use lazy_static::lazy_static;
-    /// use odbc_api::{Environment, Error, Cursor, ConnectionOptions};
+    /// use odbc_api::{environment, Error, Cursor, ConnectionOptions};
     ///
-    /// lazy_static! {
-    ///     static ref ENV: Environment = unsafe { Environment::new().unwrap() };
-    /// }
     ///
     /// const CONNECTION_STRING: &str =
-    ///     "Driver={ODBC Driver 17 for SQL Server};\
+    ///     "Driver={ODBC Driver 18 for SQL Server};\
     ///     Server=localhost;UID=SA;\
     ///     PWD=My@Test@Password1;";
     ///
     /// fn execute_query(query: &str) -> Result<Option<impl Cursor>, Error> {
-    ///     let conn = ENV.connect_with_connection_string(
+    ///     let env = environment()?;
+    ///     let conn = env.connect_with_connection_string(
     ///         CONNECTION_STRING,
     ///         ConnectionOptions::default()
     ///     )?;
     ///
-    ///     // connect.execute(&query, ()) // Compiler error: Would return local ref to `conn`.
+    ///     // connect.execute(&query, (), None) // Compiler error: Would return local ref to
+    ///                                          // `conn`.
     ///
-    ///     conn.into_cursor(&query, ())
+    ///     let maybe_cursor = conn.into_cursor(&query, (), None)?;
+    ///     Ok(maybe_cursor)
     /// }
     /// ```
     pub fn into_cursor(
         self,
         query: &str,
         params: impl ParameterCollectionRef,
-    ) -> Result<Option<CursorImpl<StatementConnection<'c>>>, Error> {
-        let cursor = match self.execute(query, params) {
-            Ok(Some(cursor)) => cursor,
+        query_timeout_sec: Option<usize>,
+    ) -> Result<Option<OwnedCursor<Connection<'c>>>, ConnectionAndError<'c>> {
+        // With the current Rust version the borrow checker needs some convincing, so that it allows
+        // us to return the Connection, even though the Result of execute borrows it.
+        let mut error = None;
+        let mut cursor = None;
+        match self.execute(query, params, query_timeout_sec) {
+            Ok(Some(c)) => cursor = Some(c),
             Ok(None) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => error = Some(e),
         };
+        if let Some(e) = error {
+            drop(cursor);
+            return Err(ConnectionAndError {
+                error: e,
+                previous: self,
+            });
+        }
+        let cursor = cursor.unwrap();
         // The rust compiler needs some help here. It assumes otherwise that the lifetime of the
         // resulting cursor would depend on the lifetime of `params`.
         let mut cursor = ManuallyDrop::new(cursor);
@@ -262,41 +368,43 @@ impl<'c> Connection<'c> {
     ///   execution.
     ///
     /// ```no_run
-    /// use lazy_static::lazy_static;
     /// use odbc_api::{
-    ///     Environment, Error, ColumnarBulkInserter, StatementConnection,
-    ///     buffers::{BufferDesc, AnyBuffer}, ConnectionOptions
+    ///     environment, Error, ColumnarBulkInserter, handles::StatementConnection, BindParamDesc,
+    ///     buffers::BoxColumnBuffer, ConnectionOptions, Connection, parameter::WithDataType,
     /// };
     ///
-    /// lazy_static! {
-    ///     static ref ENV: Environment = unsafe { Environment::new().unwrap() };
-    /// }
-    ///
     /// const CONNECTION_STRING: &str =
-    ///     "Driver={ODBC Driver 17 for SQL Server};\
+    ///     "Driver={ODBC Driver 18 for SQL Server};\
     ///     Server=localhost;UID=SA;\
     ///     PWD=My@Test@Password1;";
     ///
     /// /// Supports columnar bulk inserts on a heterogenous schema (columns have different types),
     /// /// takes ownership of a connection created using an environment with static lifetime.
-    /// type Inserter = ColumnarBulkInserter<StatementConnection<'static>, AnyBuffer>;
+    /// type Inserter = ColumnarBulkInserter<
+    ///     StatementConnection<Connection<'static>>,
+    ///     WithDataType<BoxColumnBuffer>
+    /// >;
     ///
     /// /// Creates an inserter which can be reused to bulk insert birthyears with static lifetime.
     /// fn make_inserter(query: &str) -> Result<Inserter, Error> {
-    ///     let conn = ENV.connect_with_connection_string(
+    ///     let env = environment()?;
+    ///     let conn = env.connect_with_connection_string(
     ///         CONNECTION_STRING,
     ///         ConnectionOptions::default()
     ///     )?;
     ///     let prepared = conn.into_prepared("INSERT INTO Birthyear (name, year) VALUES (?, ?)")?;
-    ///     let buffers = [
-    ///         BufferDesc::Text { max_str_len: 255},
-    ///         BufferDesc::I16 { nullable: false },
+    ///     let params = [
+    ///         BindParamDesc::text(255),
+    ///         BindParamDesc::i16(false),
     ///     ];
     ///     let capacity = 400;
-    ///     prepared.into_column_inserter(capacity, buffers)
+    ///     prepared.into_column_inserter(capacity, params)
     /// }
     /// ```
-    pub fn into_prepared(self, query: &str) -> Result<Prepared<StatementConnection<'c>>, Error> {
+    pub fn into_prepared(
+        self,
+        query: &str,
+    ) -> Result<Prepared<StatementConnection<Connection<'c>>>, Error> {
         let query = SqlText::new(query);
         let mut stmt = self.allocate_statement()?;
         stmt.prepare(&query).into_result(&stmt)?;
@@ -335,9 +443,23 @@ impl<'c> Connection<'c> {
     ///     Ok(())
     /// }
     /// ```
-    pub fn preallocate(&self) -> Result<Preallocated<'_>, Error> {
+    pub fn preallocate(&self) -> Result<Preallocated<StatementImpl<'_>>, Error> {
         let stmt = self.allocate_statement()?;
         unsafe { Ok(Preallocated::new(stmt)) }
+    }
+
+    /// Creates a preallocated statement handle like [`Self::preallocate`]. Yet the statement handle
+    /// also takes ownership of the connection.
+    pub fn into_preallocated(
+        self,
+    ) -> Result<Preallocated<StatementConnection<Connection<'c>>>, Error> {
+        let stmt = self.allocate_statement()?;
+        // Safe: We know `stmt` is a valid statement handle and self is the connection which has
+        // been used to allocate it.
+        unsafe {
+            let stmt = StatementConnection::new(stmt.into_sys(), self);
+            Ok(Preallocated::new(stmt))
+        }
     }
 
     /// Specify the transaction mode. By default, ODBC transactions are in auto-commit mode.
@@ -425,29 +547,21 @@ impl<'c> Connection<'c> {
         Ok(name)
     }
 
-    /// A cursor describing columns of all tables matching the patterns. Patterns support as
-    /// placeholder `%` for multiple characters or `_` for a single character. Use `\` to escape.The
-    /// returned cursor has the columns:
-    /// `TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `COLUMN_NAME`, `DATA_TYPE`, `TYPE_NAME`,
-    /// `COLUMN_SIZE`, `BUFFER_LENGTH`, `DECIMAL_DIGITS`, `NUM_PREC_RADIX`, `NULLABLE`,
-    /// `REMARKS`, `COLUMN_DEF`, `SQL_DATA_TYPE`, `SQL_DATETIME_SUB`, `CHAR_OCTET_LENGTH`,
-    /// `ORDINAL_POSITION`, `IS_NULLABLE`.
+    /// An iterator over the columns of tables matching the patterns. Patterns support `%` for
+    /// multiple characters or `_` for a single character. Use `\` to escape.
     ///
-    /// In addition to that there may be a number of columns specific to the data source.
+    /// Returns an iterator over [`ColumnsRow`] items. If you need the raw cursor (e.g. to access
+    /// driver-specific columns beyond the standard 18), use [`Preallocated::columns_cursor`]
+    /// instead.
     pub fn columns(
         &self,
         catalog_name: &str,
         schema_name: &str,
         table_name: &str,
         column_name: &str,
-    ) -> Result<CursorImpl<StatementImpl<'_>>, Error> {
-        execute_columns(
-            self.allocate_statement()?,
-            &SqlText::new(catalog_name),
-            &SqlText::new(schema_name),
-            &SqlText::new(table_name),
-            &SqlText::new(column_name),
-        )
+    ) -> Result<BlockCursorIterator<CursorImpl<StatementImpl<'_>>, ColumnsRow>, Error> {
+        let stmt = self.preallocate()?;
+        stmt.into_columns(catalog_name, schema_name, table_name, column_name)
     }
 
     /// List tables, schemas, views and catalogs of a datasource.
@@ -467,43 +581,16 @@ impl<'c> Connection<'c> {
     /// # Example
     ///
     /// ```
-    /// use odbc_api::{Connection, Cursor, Error, ResultSetMetadata, buffers::TextRowSet};
+    /// use odbc_api::{Connection, Error, TablesRow};
     ///
     /// fn print_all_tables(conn: &Connection<'_>) -> Result<(), Error> {
-    ///     // Set all filters to an empty string, to really print all tables
-    ///     let mut cursor = conn.tables("", "", "", "")?;
-    ///
-    ///     // The column are gonna be TABLE_CAT,TABLE_SCHEM,TABLE_NAME,TABLE_TYPE,REMARKS, but may
-    ///     // also contain additional driver specific columns.
-    ///     for (index, name) in cursor.column_names()?.enumerate() {
-    ///         if index != 0 {
-    ///             print!(",")
-    ///         }
-    ///         print!("{}", name?);
+    ///     for row in conn.tables("", "", "", "")? {
+    ///         let row: TablesRow = row?;
+    ///         let table = row.table.as_str().unwrap().unwrap_or("NULL");
+    ///         let catalog = row.catalog.as_str().unwrap().unwrap_or("NULL");
+    ///         let schema = row.schema.as_str().unwrap().unwrap_or("NULL");
+    ///         println!("{catalog}.{schema}.{table}");
     ///     }
-    ///
-    ///     let batch_size = 100;
-    ///     let mut buffer = TextRowSet::for_cursor(batch_size, &mut cursor, Some(4096))?;
-    ///     let mut row_set_cursor = cursor.bind_buffer(&mut buffer)?;
-    ///
-    ///     while let Some(row_set) = row_set_cursor.fetch()? {
-    ///         for row_index in 0..row_set.num_rows() {
-    ///             if row_index != 0 {
-    ///                 print!("\n");
-    ///             }
-    ///             for col_index in 0..row_set.num_cols() {
-    ///                 if col_index != 0 {
-    ///                     print!(",");
-    ///                 }
-    ///                 let value = row_set
-    ///                     .at_as_str(col_index, row_index)
-    ///                     .unwrap()
-    ///                     .unwrap_or("NULL");
-    ///                 print!("{}", value);
-    ///             }
-    ///         }
-    ///     }
-    ///
     ///     Ok(())
     /// }
     /// ```
@@ -513,16 +600,58 @@ impl<'c> Connection<'c> {
         schema_name: &str,
         table_name: &str,
         table_type: &str,
-    ) -> Result<CursorImpl<StatementImpl<'_>>, Error> {
-        let statement = self.allocate_statement()?;
+    ) -> Result<BlockCursorIterator<CursorImpl<StatementImpl<'_>>, TablesRow>, Error> {
+        let statement = self.preallocate()?;
+        statement.into_tables(catalog_name, schema_name, table_name, table_type)
+    }
 
-        execute_tables(
-            statement,
-            &SqlText::new(catalog_name),
-            &SqlText::new(schema_name),
-            &SqlText::new(table_name),
-            &SqlText::new(table_type),
-        )
+    /// Create a result set which contains the column names that make up the primary key for the
+    /// table.
+    ///
+    /// # Parameters
+    ///
+    /// * `catalog_name`: Catalog name. If a driver supports catalogs for some tables but not for
+    ///   others, such as when the driver retrieves data from different DBMSs, an empty string ("")
+    ///   denotes those tables that do not have catalogs. `catalog_name` must not contain a string
+    ///   search pattern.
+    /// * `schema_name`: Schema name. If a driver supports schemas for some tables but not for
+    ///   others, such as when the driver retrieves data from different DBMSs, an empty string ("")
+    ///   denotes those tables that do not have schemas. `schema_name` must not contain a string
+    ///   search pattern.
+    /// * `table_name`: Table name. `table_name` must not contain a string search pattern.
+    ///
+    /// The resulting result set contains the following columns:
+    ///
+    /// * `TABLE_CAT`: Primary key table catalog name. NULL if not applicable to the data source. If
+    ///   a driver supports catalogs for some tables but not for others, such as when the driver
+    ///   retrieves data from different DBMSs, it returns an empty string ("") for those tables that
+    ///   do not have catalogs. `VARCHAR`
+    /// * `TABLE_SCHEM`: Primary key table schema name; NULL if not applicable to the data source.
+    ///   If a driver supports schemas for some tables but not for others, such as when the driver
+    ///   retrieves data from different DBMSs, it returns an empty string ("") for those tables that
+    ///   do not have schemas. `VARCHAR`
+    /// * `TABLE_NAME`: Primary key table name. `VARCHAR NOT NULL`
+    /// * `COLUMN_NAME`: Primary key column name. The driver returns an empty string for a column
+    ///   that does not have a name. `VARCHAR NOT NULL`
+    /// * `KEY_SEQ`: Column sequence number in key (starting with 1). `SMALLINT NOT NULL`
+    /// * `PK_NAME`: Primary key name. NULL if not applicable to the data source. `VARCHAR`
+    ///
+    /// The maximum length of the VARCHAR columns is driver specific.
+    ///
+    /// If [`crate::sys::StatementAttribute::MetadataId`] statement attribute is set to true,
+    /// catalog, schema and table name parameters are treated as an identifiers and their case is
+    /// not significant. If it is false, they are ordinary arguments. As such they treated literally
+    /// and their case is significant.
+    ///
+    /// See: <https://learn.microsoft.com/sql/odbc/reference/syntax/sqlprimarykeys-function>
+    pub fn primary_keys(
+        &self,
+        catalog_name: Option<&str>,
+        schema_name: Option<&str>,
+        table_name: &str,
+    ) -> Result<BlockCursorIterator<CursorImpl<StatementImpl<'_>>, PrimaryKeysRow>, Error> {
+        let stmt = self.preallocate()?;
+        stmt.into_primary_keys(catalog_name, schema_name, table_name)
     }
 
     /// This can be used to retrieve either a list of foreign keys in the specified table or a list
@@ -537,28 +666,30 @@ impl<'c> Connection<'c> {
         fk_catalog_name: &str,
         fk_schema_name: &str,
         fk_table_name: &str,
-    ) -> Result<CursorImpl<StatementImpl<'_>>, Error> {
-        let statement = self.allocate_statement()?;
-
-        execute_foreign_keys(
-            statement,
-            &SqlText::new(pk_catalog_name),
-            &SqlText::new(pk_schema_name),
-            &SqlText::new(pk_table_name),
-            &SqlText::new(fk_catalog_name),
-            &SqlText::new(fk_schema_name),
-            &SqlText::new(fk_table_name),
+    ) -> Result<BlockCursorIterator<CursorImpl<StatementImpl<'_>>, ForeignKeysRow>, Error> {
+        let statement = self.preallocate()?;
+        statement.into_foreign_keys(
+            pk_catalog_name,
+            pk_schema_name,
+            pk_table_name,
+            fk_catalog_name,
+            fk_schema_name,
+            fk_table_name,
         )
     }
 
     /// The buffer descriptions for all standard buffers (not including extensions) returned in the
-    /// columns query (e.g. [`Connection::columns`]).
+    /// columns query (e.g. [`Preallocated::columns_cursor`]).
     ///
     /// # Arguments
     ///
     /// * `type_name_max_len` - The maximum expected length of type names.
     /// * `remarks_max_len` - The maximum expected length of remarks.
     /// * `column_default_max_len` - The maximum expected length of column defaults.
+    #[deprecated(
+        note = "Use `Connection::columns` or `Preallocated::columns` which return strongly typed \
+        `ColumnsRow` items instead."
+    )]
     pub fn columns_buffer_descs(
         &self,
         type_name_max_len: usize,
@@ -650,6 +781,32 @@ impl<'c> Connection<'c> {
     }
 }
 
+/// Implement `Debug` for [`Connection`], in order to play nice with derive Debugs for struct
+/// holding a [`Connection`].
+impl Debug for Connection<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Connection")
+    }
+}
+
+/// We need to implement [`StatementParent`] for [`Connection`] in order to express ownership of a
+/// connection for a statement handle. This is e.g. needed for [`Connection::into_cursor`].
+///
+/// # Safety:
+///
+/// Connection wraps an open Connection. It keeps the handle alive and valid during its lifetime.
+unsafe impl StatementParent for Connection<'_> {}
+
+/// We need to implement [`StatementParent`] for `Arc<Connection>` in order to be able to express
+/// ownership of a shared connection from a statement handle. This is e.g. needed for
+/// [`ConnectionTransitions::into_cursor`].
+///
+/// # Safety:
+///
+/// `Arc<Connection>` wraps an open Connection. It keeps the handle alive and valid during its
+/// lifetime.
+unsafe impl StatementParent for Arc<Connection<'_>> {}
+
 /// Options to be passed then opening a connection to a datasource.
 #[derive(Default, Clone, Copy)]
 pub struct ConnectionOptions {
@@ -702,7 +859,7 @@ impl ConnectionOptions {
 /// let password = "abc;123}";
 /// let user = "SA";
 /// let mut connection_string_without_credentials =
-///     "Driver={ODBC Driver 17 for SQL Server};Server=localhost;";
+///     "Driver={ODBC Driver 18 for SQL Server};Server=localhost;";
 ///
 /// let connection_string = format!(
 ///     "{}UID={};PWD={};",
@@ -712,7 +869,7 @@ impl ConnectionOptions {
 /// );
 ///
 /// assert_eq!(
-///     "Driver={ODBC Driver 17 for SQL Server};Server=localhost;UID=SA;PWD={abc;123}}};",
+///     "Driver={ODBC Driver 18 for SQL Server};Server=localhost;UID=SA;PWD={abc;123}}};",
 ///     connection_string
 /// );
 /// ```
@@ -738,5 +895,233 @@ pub fn escape_attribute_value(unescaped: &str) -> Cow<'_, str> {
         Cow::Owned(format!("{{{escaped}}}"))
     } else {
         Cow::Borrowed(unescaped)
+    }
+}
+
+/// A pair of the error and the previous state, before the operation caused the error.
+///
+/// Some functions in this crate take a `self` and return another type in the result to express a
+/// state transitions in the underlying ODBC handle. In order to make such operations retryable, or
+/// offer other alternatives of recovery, they may return this error type instead of a plain
+/// [`Error`].
+#[derive(Debug)]
+pub struct FailedStateTransition<S> {
+    /// The ODBC error which caused the state transition to fail.
+    pub error: Error,
+    /// The state before the transition failed. This is useful to e.g. retry the operation, or
+    /// recover in another way.
+    pub previous: S,
+}
+
+impl<S> From<FailedStateTransition<S>> for Error {
+    fn from(value: FailedStateTransition<S>) -> Self {
+        value.error
+    }
+}
+
+impl<S> Display for FailedStateTransition<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl<S> std::error::Error for FailedStateTransition<S>
+where
+    S: Debug,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+/// An error type wrapping an [`Error`] and a [`Connection`]. It is used by
+/// [`Connection::into_cursor`], so that in case of failure the user can reuse the connection to try
+/// again. [`Connection::into_cursor`] could achieve the same by returning a tuple in case of an
+/// error, but this type causes less friction in most scenarios because [`Error`] implements
+/// [`From`] [`ConnectionAndError`] and it therfore works with the question mark operater (`?`).
+type ConnectionAndError<'conn> = FailedStateTransition<Connection<'conn>>;
+
+/// Ability to transition ownership of the connection to various children which represent statement
+/// handles in various states. E.g. [`crate::Prepared`] or [`crate::Cursor`]. Transfering ownership
+/// of the connection could e.g. be useful if you want to clean the connection after you are done
+/// with the child.
+///
+/// Having this in a trait rather than directly on [`Connection`] allows us to be generic over the
+/// type of ownership we express. E.g. we can express shared ownership of a connection by
+/// using an `Arc<Mutex<Connection>>` or `Arc<Connection>`. Or a still exclusive ownership using
+/// a plain [`Connection`].
+pub trait ConnectionTransitions: Sized {
+    // Note to self. This might eveolve into a `Connection` trait. Which expresses ownership
+    // of a connection (shared or not). It could allow to get a dereferened borrowed conection
+    // which does not allow for state transtions as of now (like StatementRef). I may not want to
+    // rock the boat that much right now.
+
+    /// The type passed to [crate::handles::StatementConnection] to express ownership of the
+    /// connection.
+    type StatementParent: StatementParent;
+
+    /// Similar to [`crate::Connection::into_cursor`], yet it operates on an
+    /// `Arc<Mutex<Connection>>`. `Arc<Connection>` can be used if you want shared ownership of
+    /// connections. However, `Arc<Connection>` is not `Send` due to `Connection` not being `Sync`.
+    /// So sometimes you may want to wrap your `Connection` into an `Arc<Mutex<Connection>>` to
+    /// allow shared ownership of the connection across threads. This function allows you to create
+    /// a cursor from such a shared which also holds a strong reference to it.
+    ///
+    /// # Parameters
+    ///
+    /// * `query`: The text representation of the SQL statement. E.g. "SELECT * FROM my_table;".
+    /// * `params`: `?` may be used as a placeholder in the statement text. You can use `()` to
+    ///   represent no parameters. See the [`crate::parameter`] module level documentation for more
+    ///   information on how to pass parameters.
+    /// * `query_timeout_sec`: Use this to limit the time the query is allowed to take, before
+    ///   responding with data to the application. The driver may replace the number of seconds you
+    ///   provide with a minimum or maximum value.
+    ///
+    ///   For the timeout to work the driver must support this feature. E.g. PostgreSQL, and
+    ///   Microsoft SQL Server do, but SQLite or MariaDB do not.
+    ///
+    ///   You can specify ``0``, to deactivate the timeout, this is the default. So if you want no
+    ///   timeout, just leave it at `None`. Only reason to specify ``0`` is if for some reason your
+    ///   datasource does not have ``0`` as default.
+    ///
+    ///   This corresponds to `SQL_ATTR_QUERY_TIMEOUT` in the ODBC C API.
+    ///
+    ///   See: <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetstmtattr-function>
+    fn into_cursor(
+        self,
+        query: &str,
+        params: impl ParameterCollectionRef,
+        query_timeout_sec: Option<usize>,
+    ) -> Result<Option<OwnedCursor<Self::StatementParent>>, FailedStateTransition<Self>>;
+
+    /// Prepares an SQL statement which takes ownership of the connection. The advantage over
+    /// [`Connection::prepare`] is, that you do not need to keep track of the lifetime of the
+    /// connection seperatly and can create types which do own the prepared query and only depend on
+    /// the lifetime of the environment.
+    ///
+    /// # Parameters
+    ///
+    /// * `query`: The text representation of the SQL statement. E.g. "SELECT * FROM my_table;". `?`
+    ///   may be used as a placeholder in the statement text, to be replaced with parameters during
+    ///   execution.
+    ///
+    /// ```no_run
+    /// use odbc_api::{
+    ///     environment, Error, ColumnarBulkInserter, ConnectionTransitions, Connection,
+    ///     handles::StatementConnection, buffers::BoxColumnBuffer, ConnectionOptions,
+    ///     BindParamDesc, parameter::WithDataType,
+    /// };
+    ///
+    /// const CONNECTION_STRING: &str =
+    ///     "Driver={ODBC Driver 18 for SQL Server};\
+    ///     Server=localhost;UID=SA;\
+    ///     PWD=My@Test@Password1;";
+    ///
+    /// /// Supports columnar bulk inserts on a heterogenous schema (columns have different types),
+    /// /// takes ownership of a connection created using an environment with static lifetime.
+    /// type Inserter = ColumnarBulkInserter<
+    ///     StatementConnection<Connection<'static>>,
+    ///     WithDataType<BoxColumnBuffer>
+    /// >;
+    ///
+    /// /// Creates an inserter which can be reused to bulk insert birthyears with static lifetime.
+    /// fn make_inserter(query: &str) -> Result<Inserter, Error> {
+    ///     let env = environment()?;
+    ///     let conn = env.connect_with_connection_string(
+    ///         CONNECTION_STRING,
+    ///         ConnectionOptions::default()
+    ///     )?;
+    ///     let prepared = conn.into_prepared("INSERT INTO Birthyear (name, year) VALUES (?, ?)")?;
+    ///     let buffers = [
+    ///         BindParamDesc::text(255),
+    ///         BindParamDesc::i16(false),
+    ///     ];
+    ///     let capacity = 400;
+    ///     prepared.into_column_inserter(capacity, buffers)
+    /// }
+    /// ```
+    fn into_prepared(
+        self,
+        query: &str,
+    ) -> Result<Prepared<StatementConnection<Self::StatementParent>>, Error>;
+
+    /// Creates a preallocated statement handle like [`Connection::preallocate`]. Yet the statement
+    /// also takes ownership of the connection.
+    fn into_preallocated(
+        self,
+    ) -> Result<Preallocated<StatementConnection<Self::StatementParent>>, Error>;
+}
+
+impl<'env> ConnectionTransitions for Connection<'env> {
+    type StatementParent = Self;
+
+    fn into_cursor(
+        self,
+        query: &str,
+        params: impl ParameterCollectionRef,
+        query_timeout_sec: Option<usize>,
+    ) -> Result<Option<OwnedCursor<Self>>, FailedStateTransition<Self>> {
+        self.into_cursor(query, params, query_timeout_sec)
+    }
+
+    fn into_prepared(self, query: &str) -> Result<Prepared<StatementConnection<Self>>, Error> {
+        self.into_prepared(query)
+    }
+
+    fn into_preallocated(self) -> Result<Preallocated<StatementConnection<Self>>, Error> {
+        self.into_preallocated()
+    }
+}
+
+impl<'env> ConnectionTransitions for Arc<Connection<'env>> {
+    type StatementParent = Self;
+
+    fn into_cursor(
+        self,
+        query: &str,
+        params: impl ParameterCollectionRef,
+        query_timeout_sec: Option<usize>,
+    ) -> Result<Option<OwnedCursor<Self>>, FailedStateTransition<Self>> {
+        // Result borrows the connection. We convert the cursor into a raw pointer, to not confuse
+        // the borrow checker.
+        let result = self.execute(query, params, query_timeout_sec);
+        let maybe_stmt_ptr = result
+            .map(|opt| opt.map(|cursor| cursor.into_stmt().into_sys()))
+            .map_err(|error| {
+                // If the execute fails, we return a FailedStateTransition with the error and the
+                // connection.
+                FailedStateTransition {
+                    error,
+                    previous: Arc::clone(&self),
+                }
+            })?;
+        let Some(stmt_ptr) = maybe_stmt_ptr else {
+            return Ok(None);
+        };
+        // Safe: The connection is the parent of the statement referenced by `stmt_ptr`.
+        let stmt = unsafe { StatementConnection::new(stmt_ptr, self) };
+        // Safe: `stmt` is valid and in cursor state.
+        let cursor = unsafe { CursorImpl::new(stmt) };
+        Ok(Some(cursor))
+    }
+
+    fn into_prepared(self, query: &str) -> Result<Prepared<StatementConnection<Self>>, Error> {
+        let stmt = self.prepare(query)?;
+        let stmt_ptr = stmt.into_handle().into_sys();
+        // Safe: The connection is the parent of the statement referenced by `stmt_ptr`.
+        let stmt = unsafe { StatementConnection::new(stmt_ptr, self) };
+        // `stmt` is valid and in prepared state.
+        let prepared = Prepared::new(stmt);
+        Ok(prepared)
+    }
+
+    fn into_preallocated(self) -> Result<Preallocated<StatementConnection<Self>>, Error> {
+        let stmt = self.preallocate()?;
+        let stmt_ptr = stmt.into_handle().into_sys();
+        // Safe: The connection is the parent of the statement referenced by `stmt_ptr`.
+        let stmt = unsafe { StatementConnection::new(stmt_ptr, self) };
+        // Safe: `stmt` is valid and its state is allocated.
+        let preallocated = unsafe { Preallocated::new(stmt) };
+        Ok(preallocated)
     }
 }

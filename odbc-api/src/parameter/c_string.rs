@@ -1,16 +1,15 @@
 //! Module contains trait implementations for `CStr` and `CString`.
 
 use std::{
-    ffi::{c_void, CStr, CString},
+    ffi::{CStr, CString, c_void},
     num::NonZeroUsize,
 };
 
 use odbc_sys::{CDataType, NTS};
 
 use crate::{
-    handles::{CData, HasDataType},
-    parameter::InputParameter,
     DataType,
+    handles::{CData, HasDataType},
 };
 
 use super::CElement;
@@ -45,7 +44,6 @@ unsafe impl CElement for CStr {
     /// is always complete.
     fn assert_completness(&self) {}
 }
-impl InputParameter for CStr {}
 
 unsafe impl CData for CString {
     fn cdata_type(&self) -> CDataType {

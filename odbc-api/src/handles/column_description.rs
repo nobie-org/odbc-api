@@ -1,6 +1,6 @@
 use super::{
     data_type::DataType,
-    sql_char::{slice_to_utf8, DecodingError, SqlChar},
+    sql_char::{DecodingError, SqlChar, slice_to_utf8},
 };
 
 /// Indication of whether a column is nullable or not.
@@ -33,6 +33,15 @@ impl Nullability {
             other => panic!("ODBC returned invalid value for Nullable: {}", other.0),
         }
     }
+
+    /// `true` if the column is `Nullable` or it is not know whether the column is nullable. `false`
+    /// if and only if the column is `NoNulls`.
+    pub fn could_be_nullable(&self) -> bool {
+        match self {
+            Nullability::Nullable | Nullability::Unknown => true,
+            Nullability::NoNulls => false,
+        }
+    }
 }
 
 /// Describes the type and attributes of a column.
@@ -53,14 +62,14 @@ impl ColumnDescription {
     /// [`ColumnDescription`]. This constructor enables you to do that, without caring which type
     /// `SqlChar` resolves to.
     pub fn new(name: &str, data_type: DataType, nullability: Nullability) -> Self {
-        #[cfg(feature = "narrow")]
+        #[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
         pub fn utf8_to_vec_char(text: &str) -> Vec<u8> {
             text.to_owned().into_bytes()
         }
-        #[cfg(not(feature = "narrow"))]
+        #[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
         pub fn utf8_to_vec_char(text: &str) -> Vec<u16> {
-            use widestring::U16String;
-            U16String::from_str(text).into_vec()
+            use widestring::Utf16String;
+            Utf16String::from_str(text).into_vec()
         }
         Self {
             name: utf8_to_vec_char(name),
@@ -78,10 +87,7 @@ impl ColumnDescription {
     /// `true` if the column is `Nullable` or it is not know whether the column is nullable. `false`
     /// if and only if the column is `NoNulls`.
     pub fn could_be_nullable(&self) -> bool {
-        match self.nullability {
-            Nullability::Nullable | Nullability::Unknown => true,
-            Nullability::NoNulls => false,
-        }
+        self.nullability.could_be_nullable()
     }
 }
 

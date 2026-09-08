@@ -3,16 +3,17 @@ use std::{
     ffi::c_void,
     marker::PhantomData,
     mem::{size_of, size_of_val},
-    num::NonZeroUsize, str::Utf8Error,
+    num::NonZeroUsize,
+    str::Utf8Error,
 };
 
 use odbc_sys::{CDataType, NULL_DATA};
-use widestring::{U16Str, U16String};
+use widestring::{Utf16Str, Utf16String};
 
 use crate::{
-    buffers::{FetchRowMember, Indicator},
-    handles::{CData, CDataMut, HasDataType},
     DataType, OutputParameter,
+    buffers::{FetchRowMember, Indicator},
+    handles::{ASSUMED_MAX_LENGTH_OF_W_VARCHAR, CData, CDataMut, HasDataType},
 };
 
 use super::CElement;
@@ -23,13 +24,13 @@ use super::CElement;
 ///
 /// * [`Self::TERMINATING_ZEROES`] is used to calculate buffer offsets. The number of terminating
 ///   zeroes is expressed in `BufferElement`s.
-/// * [`Self::C_DATA_TYPE`] is used to bind parameters. Providing wrong values like e.g. a fixed length
-///   types, would cause even a correctly implemented odbc driver to access invalid memory.
-pub unsafe trait VarKind {
+/// * [`Self::C_DATA_TYPE`] is used to bind parameters. Providing wrong values like e.g. a fixed
+///   length types, would cause even a correctly implemented odbc driver to access invalid memory.
+pub unsafe trait VarKind: Send {
     /// Either `u8` for binary and narrow text or `u16` for wide text. Wide text could also be
     /// represented as `u8`, after all everything is bytes. This makes it difficult though to create
     /// owned VarCell types from `u16` buffers.
-    type Element: Copy + Eq;
+    type Element: Copy + Eq + Send;
     /// Zero for buffer element.
     const ZERO: Self::Element;
     /// Number of terminating zeroes required for this kind of variadic buffer.
@@ -54,6 +55,10 @@ unsafe impl VarKind for Text {
     fn relational_type(length: usize) -> DataType {
         // Since we might use as an input buffer, we report the full buffer length in the type and
         // do not deduct 1 for the terminating zero.
+
+        // For some reason (unknown to me) there has been no need to switch the LongVarchar type in
+        // order to support larger strings (so far).
+
         DataType::Varchar {
             length: NonZeroUsize::new(length),
         }
@@ -75,8 +80,16 @@ unsafe impl VarKind for WideText {
     fn relational_type(length: usize) -> DataType {
         // Since we might use as an input buffer, we report the full buffer length in the type and
         // do not deduct 1 for the terminating zero.
-        DataType::WVarchar {
-            length: NonZeroUsize::new(length),
+        // Also some depending on the datasource Varchar may have a length limit. We decide here to
+        // use LongVarchar above the cutoff of 4000.
+        if length <= ASSUMED_MAX_LENGTH_OF_W_VARCHAR {
+            DataType::WVarchar {
+                length: NonZeroUsize::new(length),
+            }
+        } else {
+            DataType::WLongVarchar {
+                length: NonZeroUsize::new(length),
+            }
         }
     }
 }
@@ -190,15 +203,15 @@ where
     K: VarKind<Element = u16>,
 {
     /// Create an owned parameter containing the character data from the passed string.
-    pub fn from_u16_string(val: U16String) -> Self {
+    pub fn from_utf16_string(val: Utf16String) -> Self {
         Self::from_vec(val.into_vec())
     }
 
     /// Create an owned parameter containing the character data from the passed string. Converts it
     /// to UTF-16 and allocates it.
     pub fn from_str_slice(val: &str) -> Self {
-        let utf16 = U16String::from_str(val);
-        Self::from_u16_string(utf16)
+        let utf16 = Utf16String::from_str(val);
+        Self::from_utf16_string(utf16)
     }
 }
 
@@ -248,7 +261,6 @@ where
     /// }
     ///
     /// fn process_text_slice(text: &[u8]) { /*...*/}
-    ///
     /// ```
     ///
     /// ```
@@ -269,7 +281,6 @@ where
     /// }
     ///
     /// fn process_slice(text: &[u8]) { /*...*/}
-    ///
     /// ```
     pub fn is_complete(&self) -> bool {
         let slice = self.buffer.borrow();
@@ -355,7 +366,8 @@ where
     /// case the indicator is `NULL_DATA`.
     pub fn as_slice(&self) -> Option<&[K::Element]> {
         let slice = self.buffer.borrow();
-        self.len_in_bytes().map(|len| &slice[..(len/size_of::<K::Element>())])
+        self.len_in_bytes()
+            .map(|len| &slice[..(len / size_of::<K::Element>())])
     }
 }
 
@@ -371,7 +383,8 @@ where
     }
 }
 
-impl<B> VarCell<B, Text> where
+impl<B> VarCell<B, Text>
+where
     B: Borrow<[u8]>,
 {
     pub fn as_str(&self) -> Result<Option<&str>, Utf8Error> {
@@ -384,12 +397,13 @@ impl<B> VarCell<B, Text> where
     }
 }
 
-impl<B> VarCell<B, WideText> where
+impl<B> VarCell<B, WideText>
+where
     B: Borrow<[u16]>,
 {
-    pub fn as_utf16(&self) -> Option<&U16Str> {
+    pub fn as_utf16(&self) -> Option<&Utf16Str> {
         if let Some(chars) = self.as_slice() {
-            let text = U16Str::from_slice(chars);
+            let text = Utf16Str::from_slice(chars).expect("Wide character encoding must be UTF-16");
             Some(text)
         } else {
             None
@@ -467,7 +481,8 @@ where
 /// )?;
 /// if let Some(cursor) = conn.execute(
 ///     "SELECT year FROM Birthdays WHERE name=?;",
-///     &"Bernd".into_parameter())?
+///     &"Bernd".into_parameter(),
+///     None)?
 /// {
 ///     // Use cursor to process query results.
 /// };
@@ -486,7 +501,7 @@ pub type VarWCharSlice<'a> = VarWChar<&'a [u16]>;
 /// This type is created if `into_parameter` of the `IntoParameter` trait is called on a `&[u8]`.
 pub type VarBinarySlice<'a> = VarBinary<&'a [u8]>;
 
-impl<'a, K> VarCell<&'a [u8], K> {
+impl<K> VarCell<&'_ [u8], K> {
     /// Indicates missing data
     pub const NULL: Self = Self {
         // We do not want to use the empty buffer (`&[]`) here. It would be bound as `VARCHAR(0)`
@@ -498,7 +513,7 @@ impl<'a, K> VarCell<&'a [u8], K> {
     };
 }
 
-impl<'a, K> VarCell<&'a [u16], K> {
+impl<K> VarCell<&'_ [u16], K> {
     /// Indicates missing data
     pub const NULL: Self = Self {
         // We do not want to use the empty buffer (`&[]`) here. It would be bound as `VARCHAR(0)`
@@ -538,6 +553,20 @@ pub type VarBinarySliceMut<'a> = VarBinary<&'a mut [u8]>;
 ///
 /// Due to its memory layout this type can be bound either as a single parameter, or as a column of
 /// a row-by-row output, but not be used in columnar parameter arrays or output buffers.
+///
+/// You can also use [`VarCharArray`] as an output type for statement execution using
+/// [`crate::parameter::Out`] or [`crate::parameter::InOut`].
+///
+/// # Example
+///
+/// ```no_run
+/// # use odbc_api::{Connection, Error, parameter::{VarCharArray, Out}};
+/// # fn output_example(connection: Connection<'_>) -> Result<(), Error> {
+/// let mut out_msg: VarCharArray<255> = VarCharArray::NULL;
+/// connection.execute("CALL PROCEDURE_NAME(?)", (Out(&mut out_msg),), None)?;
+/// # Ok(())
+/// # }
+/// ```
 pub type VarCharArray<const LENGTH: usize> = VarChar<[u8; LENGTH]>;
 
 /// A stack allocated NVARCHAR type.
@@ -552,7 +581,10 @@ pub type VarWCharArray<const LENGTH: usize> = VarWChar<[u16; LENGTH]>;
 /// a row-by-row output, but not be used in columnar parameter arrays or output buffers.
 pub type VarBinaryArray<const LENGTH: usize> = VarBinary<[u8; LENGTH]>;
 
-impl<const LENGTH: usize, K, E> Default for VarCell<[E; LENGTH], K> where E: Default + Copy {
+impl<const LENGTH: usize, K, E> Default for VarCell<[E; LENGTH], K>
+where
+    E: Default + Copy,
+{
     fn default() -> Self {
         Self {
             buffer: [E::default(); LENGTH],

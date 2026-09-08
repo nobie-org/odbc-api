@@ -1,23 +1,16 @@
+#![allow(clippy::needless_doctest_main)]
 /*!
 # Introduction to `odbc-api` (documentation only)
 
 ## About ODBC
 
-ODBC is an open standard which allows you to connect to various data sources. Mostly these data
-sources are databases, but ODBC drivers are also available for various file types like Excel or
-CSV.
+ODBC is an open standard which allows you to connect to various data sources. Most of these data sources are databases, but ODBC drivers are also available for various file types, such as Excel or CSV.
 
-Your application does not link against a driver, but will link against an ODBC driver manager
-which must be installed on the system you intend to run the application. On modern Windows
-Platforms ODBC is always installed, on OS-X or Linux distributions a driver manager like
-[unixODBC](http://www.unixodbc.org/) must be installed.
+Your application does not link against a driver, but instead links against an ODBC driver manager, which must be installed on the system where you intend to run the application. On modern Windows platforms, ODBC is always installed; on OS-X or Linux distributions, a driver manager like [unixODBC](http://www.unixodbc.org/) must be installed.
 
-To connect to a data source a driver for the specific data source in question must be installed.
-On windows you can type 'ODBC Data Sources' into the search box to start a little GUI which
-shows you the various drivers and preconfigured data sources on your system.
+To connect to a data source, a driver for the specific data source in question must be installed. On Windows, you can type 'ODBC Data Sources' into the search box to start a little GUI which shows you the various drivers and preconfigured data sources on your system.
 
-This however is not a guide on how to configure and setup ODBC. This is a guide on how to use
-the Rust bindings for applications which want to utilize ODBC data sources.
+However, this is not a guide on how to configure and set up ODBC. This is a guide on how to use the Rust bindings for applications that want to utilize ODBC data sources.
 
 ## Quickstart
 
@@ -55,7 +48,7 @@ fn main() -> Result<(), Error> {
     )?;
 
     // Execute a one of query without any parameters.
-    match connection.execute("SELECT * FROM TableName", ())? {
+    match connection.execute("SELECT * FROM TableName", (), None)? {
         Some(mut cursor) => {
             // Write the column names to stdout
             let mut headline : Vec<String> = cursor.column_names()?.collect::<Result<_,_>>()?;
@@ -140,7 +133,7 @@ use odbc_api::{ConnectionOptions, Environment};
 let env = Environment::new()?;
 
 let connection_string = "
-    Driver={ODBC Driver 17 for SQL Server};\
+    Driver={ODBC Driver 18 for SQL Server};\
     Server=localhost;\
     UID=SA;\
     PWD=My@Test@Password1;\
@@ -199,25 +192,25 @@ you get from the pool will have exactly the attributes specified in the connecti
 Here is an example of how to create an ODBC environment with connection pooling.
 
 ```
-use lazy_static::lazy_static;
-use odbc_api::{Environment, sys::{AttrConnectionPooling, AttrCpMatch}};
+use odbc_api::{Environment, environment, sys::{AttrConnectionPooling, AttrCpMatch}};
 
-lazy_static! {
-    pub static ref ENV: Environment = {
-        // Enable connection pooling. Let driver decide whether the attributes of two connection
-        // are similar enough to change the attributes of a pooled one, to fit the requested
-        // connection, or if it is cheaper to create a new Connection from scratch.
-        // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
-        //
-        // Safety: This call changes global mutable space in the underlying ODBC driver manager.
-        unsafe {
-            Environment::set_connection_pooling(AttrConnectionPooling::DriverAware).unwrap();
-        }
-        let mut env = Environment::new().unwrap();
-        // Strict is the default, and is set here to be explicit about it.
-        env.set_connection_pooling_matching(AttrCpMatch::Strict).unwrap();
-        env
-    };
+fn main() {
+    // Enable connection pooling. Let driver decide whether the attributes of two connection
+    // are similar enough to change the attributes of a pooled one, to fit the requested
+    // connection, or if it is cheaper to create a new Connection from scratch.
+    // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
+    //
+    // Safety: This call changes global mutable space in the underlying ODBC driver manager. Easiest
+    // to prove it is not causing a raise by calling it once right at the startup of your
+    // application.
+    unsafe {
+        Environment::set_connection_pooling(AttrConnectionPooling::DriverAware).unwrap();
+    }
+
+    // As long as `environment` is called for the first time **after** connection pooling is
+    // activated the static environment returned by it will have it activated.
+    let env = environment();
+    // ... use env to do db stuff
 }
 ```
 
@@ -236,7 +229,10 @@ let mut conn = env.connect(
     "YourDatabase", "SA", "My@Test@Password1",
     ConnectionOptions::default()
 )?;
-if let Some(cursor) = conn.execute("SELECT year, name FROM Birthdays;", ())? {
+let query = "SELECT year, name FROM Birthdays;";
+let parameters = (); // This query does not use any parameters.
+let timeout_sec = None;
+if let Some(cursor) = conn.execute(query, parameters, timeout_sec)? {
     // Use cursor to process query results.
 }
 # Ok::<(), odbc_api::Error>(())
@@ -319,6 +315,35 @@ fn interactive(conn: &Connection) -> io::Result<()>{
 }
 ```
 
+### Asynchronous execution using polling mode
+
+ODBC supports asynchronous execution of queries. It offers two modes: Notification and Polling.
+Notification to the authors knowlegde is only supported by the Driver Manager shipping with
+Microsoft Windows. Polling mode is also supported by unixODBC. This crate only supports the Polling
+model.
+
+⚠️**Attention**⚠️: Your driver manager (e.g. UnixODBC) may support polling mode, your driver may not.
+The function call may succeed without an error, but actually block the thread during the entire
+operation. In a manual check performed by the author with the drivers of PostgreSQL, MariaDB, SQLite
+and Microsoft SQL Server on a windows machine only the Microsoft SQL Server driver actually returned
+control to the application during statement execution. It seems asynchrnous execution is not widely
+supported.
+
+Generic applications which want to support a wide array of drivers should use one or more system
+threads executing actors using the blocking ODBC api, and communicate the query results via channels
+to the rest of the async applications.
+
+This caveat aside, using the polling mode api is the only way to execute many statements at once
+with few system threads.
+
+Functions in this crate which support asynchronous execution using polling mode:
+
+* [`crate::Connection::execute_polling`]
+* [`crate::Preallocated::into_polling`]
+
+See also the ODBC reference on polling execution:
+<https://learn.microsoft.com/sql/odbc/reference/develop-app/asynchronous-execution-polling-method>
+
 ## Fetching results
 
 ODBC offers two ways of retrieving values from a cursor over a result set. Row by row fetching and
@@ -362,7 +387,8 @@ use odbc_api::{Connection, Error, IntoParameter};
 fn insert_birth_year(conn: &Connection, name: &str, year: i16) -> Result<(), Error>{
     conn.execute(
         "INSERT INTO Birthdays (name, year) VALUES (?, ?)",
-        (&name.into_parameter(), &year)
+        (&name.into_parameter(), &year),
+        None,
     )?;
     Ok(())
 }
@@ -375,7 +401,7 @@ row or column wise bulk inserts. Especially in pipelines for data science you ma
 buffers in a columnar layout at hand. [`crate::ColumnarBulkInserter`] can be used for bulk inserts.
 
 ```no_run
-use odbc_api::{Connection, Error, IntoParameter, buffers::BufferDesc};
+use odbc_api::{Connection, Error, IntoParameter, BindParamDesc};
 
 fn insert_birth_years(conn: &Connection, names: &[&str], years: &[i16]) -> Result<(), Error> {
 
@@ -386,8 +412,8 @@ fn insert_birth_years(conn: &Connection, names: &[&str], years: &[i16]) -> Resul
 
     // Create a columnar buffer which fits the input parameters.
     let buffer_description = [
-        BufferDesc::Text { max_str_len: 255 },
-        BufferDesc::I16 { nullable: false },
+        BindParamDesc::text(255),
+        BindParamDesc::i16(false),
     ];
     // The capacity must be able to hold at least the largest batch. We do everything in one go, so
     // we set it to the length of the input parameters.
@@ -401,7 +427,7 @@ fn insert_birth_years(conn: &Connection, names: &[&str], years: &[i16]) -> Resul
     // Fill the buffer with values column by column
     let mut col = prebound
         .column_mut(0)
-        .as_text_view()
+        .as_text()
         .expect("We know the name column to hold text.");
 
     for (index, name) in names.iter().enumerate() {

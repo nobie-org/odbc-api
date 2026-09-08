@@ -1,32 +1,40 @@
-use std::{cmp::max, collections::HashMap, ptr::null_mut, sync::Mutex};
+use std::{
+    cmp::max,
+    collections::HashMap,
+    ptr::null_mut,
+    sync::{Mutex, OnceLock},
+};
 
 use crate::{
+    Connection, DriverCompleteOption, Error,
     connection::ConnectionOptions,
     error::ExtendResult,
     handles::{
-        self, log_diagnostics, slice_to_utf8, OutputStringBuffer, SqlChar, SqlResult, SqlText,
-        State, SzBuffer,
+        self, OutputStringBuffer, SqlChar, SqlResult, SqlText, State, SzBuffer, log_diagnostics,
+        slice_to_utf8,
     },
-    Connection, DriverCompleteOption, Error,
 };
 use log::debug;
 use odbc_sys::{AttrCpMatch, AttrOdbcVersion, FetchOrientation, HWnd};
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "prompt"))]
 // Currently only windows driver manager supports prompt.
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
     platform::run_on_demand::EventLoopExtRunOnDemand,
+    window::{Window, WindowId},
 };
 
-#[cfg(not(feature = "odbc_version_3_5"))]
+#[cfg(feature = "odbc_version_3_80")]
 const ODBC_API_VERSION: AttrOdbcVersion = AttrOdbcVersion::Odbc3_80;
 
-#[cfg(feature = "odbc_version_3_5")]
+#[cfg(not(feature = "odbc_version_3_80"))]
 const ODBC_API_VERSION: AttrOdbcVersion = AttrOdbcVersion::Odbc3;
+
+#[cfg(all(feature = "odbc_version_3_80", feature = "odbc_version_3_5"))]
+compile_error!("odbc_version_3_80 and odbc_version_3_5 must not both be enabled at the same time.");
 
 /// An ODBC 3.8 environment.
 ///
@@ -45,8 +53,8 @@ pub struct Environment {
     /// ODBC environments use interior mutability to maintain iterator state then iterating over
     /// driver and / or data source information. The environment is otherwise protected by interior
     /// synchronization mechanism, yet in order to be able to access to iterate over information
-    /// using a shared reference we need to protect the interior iteration state with a mutex of its
-    /// own.
+    /// using a shared reference we need to protect the interior iteration state with a mutex of
+    /// its own.
     /// The environment is also mutable with regards to Errors, which are accessed over the handle.
     /// If multiple fallible operations are executed in parallel, we need the mutex to ensure the
     /// errors are fetched by the correct thread.
@@ -65,8 +73,8 @@ impl Environment {
     /// it in ODBC instead.
     /// Connection Pooling is governed by two attributes. The most important one is the connection
     /// pooling scheme which is `Off` by default. It must be set even before you create your ODBC
-    /// environment. It is global mutable state on the process level. Setting it in Rust is therefore
-    /// unsafe.
+    /// environment. It is global mutable state on the process level. Setting it in Rust is
+    /// therefore unsafe.
     ///
     /// The other one is changed via [`Self::set_connection_pooling_matching`]. It governs how a
     /// connection is choosen from the pool. It defaults to strict which means the `Connection` you
@@ -77,23 +85,17 @@ impl Environment {
     ///
     /// # Example
     ///
-    /// ```
-    /// use lazy_static::lazy_static;
+    /// ```no_run
     /// use odbc_api::{Environment, sys::{AttrConnectionPooling, AttrCpMatch}};
     ///
-    /// lazy_static! {
-    ///     pub static ref ENV: Environment = unsafe {
-    ///         // Enable connection pooling. Let driver decide wether the attributes of two connection
-    ///         // are similar enough to change the attributes of a pooled one, to fit the requested
-    ///         // connection, or if it is cheaper to create a new Connection from scratch.
-    ///         // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
-    ///         Environment::set_connection_pooling(AttrConnectionPooling::DriverAware).unwrap();
-    ///         let mut env = Environment::new().unwrap();
-    ///         // Strict is the default, and is set here to be explicit about it.
-    ///         env.set_connection_pooling_matching(AttrCpMatch::Strict).unwrap();
-    ///         env
-    ///     };
-    /// }
+    /// /// Create an environment with connection pooling enabled.
+    /// let env = unsafe {
+    ///     Environment::set_connection_pooling(AttrConnectionPooling::DriverAware).unwrap();
+    ///     let mut env = Environment::new().unwrap();
+    ///     // Strict is the default, and is set here to be explicit about it.
+    ///     env.set_connection_pooling_matching(AttrCpMatch::Strict).unwrap();
+    ///     env
+    /// };
     /// ```
     ///
     /// # Safety
@@ -102,10 +104,14 @@ impl Environment {
     /// > support connection pooling. This means the driver is able to handle a call on any thread
     /// > at any time and is able to connect on one thread, to use the connection on another thread,
     /// > and to disconnect on a third thread.
+    ///
+    /// Also note that this is changes global mutable state for the entire process. As such it is
+    /// vulnerable to race conditions if called from more than one place in your application. It is
+    /// recommened to call this in the beginning, before creating any connection.
     pub unsafe fn set_connection_pooling(
         scheme: odbc_sys::AttrConnectionPooling,
     ) -> Result<(), Error> {
-        match handles::Environment::set_connection_pooling(scheme) {
+        match unsafe { handles::Environment::set_connection_pooling(scheme) } {
             SqlResult::Error { .. } => Err(Error::FailedSettingConnectionPooling),
             SqlResult::Success(()) | SqlResult::SuccessWithInfo(()) => Ok(()),
             other => {
@@ -124,10 +130,10 @@ impl Environment {
     /// The following values are used to set the value of this attribute:
     ///
     /// * [`crate::sys::AttrCpMatch::Strict`] = Only connections that exactly match the connection
-    /// options in the call and the connection attributes set by the application are reused. This is
-    /// the default.
+    ///   options in the call and the connection attributes set by the application are reused. This
+    ///   is the default.
     /// * [`crate::sys::AttrCpMatch::Relaxed`] = Connections with matching connection string \
-    /// keywords can be used. Keywords must match, but not all connection attributes must match.
+    ///   keywords can be used. Keywords must match, but not all connection attributes must match.
     pub fn set_connection_pooling_matching(&mut self, matching: AttrCpMatch) -> Result<(), Error> {
         self.environment
             .set_connection_pooling_matching(matching)
@@ -159,7 +165,10 @@ impl Environment {
             other => panic!("Unexpected return value '{other:?}'"),
         };
 
+        #[cfg(not(feature = "structured_logging"))]
         debug!("ODBC Environment created.");
+        #[cfg(feature = "structured_logging")]
+        debug!(target: "odbc_api", "ODBC environment created");
 
         let result = environment
             .declare_version(ODBC_API_VERSION)
@@ -185,6 +194,15 @@ impl Environment {
             _ => Error::Diagnostics { record, function },
         })?;
 
+        #[cfg(not(feature = "structured_logging"))]
+        debug!("ODBC API version {ODBC_API_VERSION:?} declared");
+        #[cfg(feature = "structured_logging")]
+        debug!(
+            target: "odbc_api",
+            version:? = ODBC_API_VERSION;
+            "ODBC version declared"
+        );
+
         Ok(Self {
             environment,
             internal_state: Mutex::new(()),
@@ -199,7 +217,7 @@ impl Environment {
     /// # Arguments
     ///
     /// * `data_source_name` - Data source name. The data might be located on the same computer as
-    /// the program, or on another computer somewhere on a network.
+    ///   the program, or on another computer somewhere on a network.
     /// * `user` - User identifier.
     /// * `pwd` - Authentication string (typically the password).
     ///
@@ -256,7 +274,7 @@ impl Environment {
     /// let env = Environment::new()?;
     ///
     /// let connection_string = "
-    ///     Driver={ODBC Driver 17 for SQL Server};\
+    ///     Driver={ODBC Driver 18 for SQL Server};\
     ///     Server=localhost;\
     ///     UID=SA;\
     ///     PWD=My@Test@Password1;\
@@ -303,8 +321,8 @@ impl Environment {
     ///   time of this writing:
     ///   * Maria DB crashes with STATUS_TACK_BUFFER_OVERRUN
     ///   * SQLite does not change the output buffer at all and does not indicate truncation.
-    /// * `driver_completion`: Specifies how and if the driver manager uses a prompt to complete
-    ///   the provided connection string. For arguments other than
+    /// * `driver_completion`: Specifies how and if the driver manager uses a prompt to complete the
+    ///   provided connection string. For arguments other than
     ///   [`crate::DriverCompleteOption::NoPrompt`] this method is going to create a message only
     ///   parent window for you on windows. On other platform this method is going to panic. In case
     ///   you want to provide your own parent window please use [`Self::driver_connect_with_hwnd`].
@@ -324,7 +342,10 @@ impl Environment {
     /// let connection = env.driver_connect(
     ///     "",
     ///     &mut output_buffer,
+    ///     #[cfg(target_os = "windows")]
     ///     DriverCompleteOption::Prompt,
+    ///     #[cfg(not(target_os = "windows"))]
+    ///     DriverCompleteOption::NoPrompt,
     /// )?;
     ///
     /// // Check that the output buffer has been large enough to hold the entire connection string.
@@ -396,22 +417,20 @@ impl Environment {
                 hwnd,
             )
         };
-        
+
         match driver_completion {
             DriverCompleteOption::NoPrompt => (),
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", feature = "prompt"))]
             _ => {
                 // We need a parent window, let's provide a message only window.
                 let mut window_app = MessageOnlyWindowEventHandler {
                     run_prompt_dialog: Some(driver_connect),
-                    result: None
+                    result: None,
                 };
                 let mut event_loop = EventLoop::new().unwrap();
                 event_loop.run_app_on_demand(&mut window_app).unwrap();
                 return window_app.result.unwrap();
             }
-            #[cfg(not(target_os = "windows"))]
-            _ => panic!("Prompt is not supported for non-windows systems.")
         };
         let hwnd = null_mut();
         driver_connect(hwnd)
@@ -436,14 +455,15 @@ impl Environment {
         let mut connection = self.allocate_connection()?;
         let connection_string = SqlText::new(connection_string);
 
-        let connection_string_is_complete = connection
-            .driver_connect(
+        let connection_string_is_complete = unsafe {
+            connection.driver_connect(
                 &connection_string,
                 parent_window,
                 completed_connection_string,
                 driver_completion.as_sys(),
             )
-            .into_result_bool(&connection)?;
+        }
+        .into_result_bool(&connection)?;
         if !connection_string_is_complete {
             return Err(Error::AbortedConnectionStringCompletion);
         }
@@ -478,7 +498,9 @@ impl Environment {
                 .environment
                 // Start with first so we are independent of state
                 .drivers_buffer_len(FetchOrientation::First)
-                .into_result_option(&self.environment)?
+                .map(Some)
+                .on_no_data(|| None)
+                .into_result(&self.environment)?
             {
                 res
             } else {
@@ -490,7 +512,8 @@ impl Environment {
             while let Some((candidate_desc_len, candidate_attr_len)) = self
                 .environment
                 .drivers_buffer_len(FetchOrientation::Next)
-                .into_result_option(&self.environment)?
+                .or_no_data()
+                .into_result(&self.environment)?
             {
                 desc_len = max(candidate_desc_len, desc_len);
                 attr_len = max(candidate_attr_len, attr_len);
@@ -589,7 +612,8 @@ impl Environment {
             let (mut server_name_len, mut driver_len) = if let Some(res) = self
                 .environment
                 .data_source_buffer_len(direction)
-                .into_result_option(&self.environment)?
+                .or_no_data()
+                .into_result(&self.environment)?
             {
                 res
             } else {
@@ -601,7 +625,8 @@ impl Environment {
             while let Some((candidate_name_len, candidate_decs_len)) = self
                 .environment
                 .drivers_buffer_len(FetchOrientation::Next)
-                .into_result_option(&self.environment)?
+                .or_no_data()
+                .into_result(&self.environment)?
             {
                 server_name_len = max(candidate_name_len, server_name_len);
                 driver_len = max(candidate_decs_len, driver_len);
@@ -637,12 +662,34 @@ impl Environment {
         Ok(data_source_info)
     }
 
-    fn allocate_connection(&self) -> Result<handles::Connection, Error> {
+    fn allocate_connection(&self) -> Result<handles::Connection<'_>, Error> {
         // Hold lock diagnostics errors are consumed in this thread.
         let _lock = self.internal_state.lock().unwrap();
         self.environment
             .allocate_connection()
             .into_result(&self.environment)
+    }
+}
+
+/// An ODBC [`Environment`] with static lifetime. This function always returns a reference to the
+/// same instance. The environment is constructed then the function is called for the first time.
+/// Every time after the initial construction this function must succeed.
+///
+/// Useful if your application uses ODBC for the entirety of its lifetime, since using a static
+/// lifetime means there is one less lifetime you and the borrow checker need to worry about. If
+/// your application only wants to use odbc for part of its runtime, you may want to use
+/// [`Environment`] directly in order to explicitly free its associated resources earlier. No matter
+/// the application, it is recommended to only have one [`Environment`] per process.
+pub fn environment() -> Result<&'static Environment, Error> {
+    static ENV: OnceLock<Environment> = OnceLock::new();
+    if let Some(env) = ENV.get() {
+        // Environment already initialized, nothing to do, but to return it.
+        Ok(env)
+    } else {
+        // ODBC Environment not initialized yet. Let's do so and return it.
+        let env = Environment::new()?;
+        let env = ENV.get_or_init(|| env);
+        Ok(env)
     }
 }
 
@@ -667,14 +714,17 @@ pub struct DataSourceInfo {
 }
 
 /// Message loop for prompt dialog. Used by [`Environment::driver_connect`].
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "prompt"))]
 struct MessageOnlyWindowEventHandler<'a, F> {
     run_prompt_dialog: Option<F>,
     result: Option<Result<Connection<'a>, Error>>,
 }
 
-#[cfg(target_os = "windows")]
-impl<'a, F> ApplicationHandler for MessageOnlyWindowEventHandler<'a, F> where F: FnOnce(HWnd) -> Result<Connection<'a>, Error> {
+#[cfg(all(target_os = "windows", feature = "prompt"))]
+impl<'a, F> ApplicationHandler for MessageOnlyWindowEventHandler<'a, F>
+where
+    F: FnOnce(HWnd) -> Result<Connection<'a>, Error>,
+{
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let parent_window = event_loop
             .create_window(Window::default_attributes().with_visible(false))
@@ -728,14 +778,5 @@ mod tests {
         assert_eq!(attributes["FileUsage"], "0");
         assert_eq!(attributes["SQLLevel"], "1");
         assert_eq!(attributes["UsageCount"], "1");
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    #[should_panic(expected = "Prompt is not supported for non-windows systems.")]
-    fn driver_connect_with_prompt_panics_under_linux() {
-        let env = Environment::new().unwrap();
-        let mut out = OutputStringBuffer::empty();
-        env.driver_connect("", &mut out, DriverCompleteOption::Prompt).unwrap();
     }
 }

@@ -1,26 +1,43 @@
+mod block_cursor;
+mod concurrent_block_cursor;
+mod polling_cursor;
+
+use log::warn;
 use odbc_sys::HStmt;
 
 use crate::{
+    Error, ResultSetMetadata,
     buffers::Indicator,
     error::ExtendResult,
-    handles::{AsStatementRef, CDataMut, SqlResult, State, Statement, StatementRef},
+    handles::{
+        AsStatementRef, CDataMut, DiagnosticStream, SqlResult, State, Statement,
+        StatementConnection, StatementRef, log_diagnostic_record,
+    },
     parameter::{Binary, CElement, Text, VarCell, VarKind, WideText},
-    sleep::{wait_for, Sleep},
-    Error, ResultSetMetadata,
 };
 
 use std::{
-    mem::{size_of, MaybeUninit},
+    mem::{MaybeUninit, size_of},
     ptr,
     thread::panicking,
 };
+
+pub use self::{
+    block_cursor::{BlockCursor, BlockCursorIterator},
+    concurrent_block_cursor::ConcurrentBlockCursor,
+    polling_cursor::{BlockCursorPolling, CursorPolling},
+};
+
+/// A cursor which owns both its statement and its connection. It is generic over the type of
+/// ownership of the connection. E.g. [`SharedConnection`] or just plain [`Connection`].
+pub type OwnedCursor<P> = CursorImpl<StatementConnection<P>>;
 
 /// Cursors are used to process and iterate the result sets returned by executing queries.
 ///
 /// # Example: Fetching result in batches
 ///
 /// ```rust
-/// use odbc_api::{Cursor, buffers::{BufferDesc, ColumnarAnyBuffer}, Error};
+/// use odbc_api::{Cursor, buffers::{BufferDesc, ColumnarDynBuffer}, Error};
 ///
 /// /// Fetches all values from the first column of the cursor as i32 in batches of 100 and stores
 /// /// them in a vector.
@@ -33,7 +50,7 @@ use std::{
 ///     // runtime.
 ///     let description = BufferDesc::I32 { nullable: false };
 ///     // This is the buffer we bind to the driver, and repeatedly use to fetch each batch
-///     let buffer = ColumnarAnyBuffer::from_descs(batch_size, [description]);
+///     let buffer = ColumnarDynBuffer::from_descs(batch_size, [description]);
 ///     // Bind buffer to cursor
 ///     let mut row_set_buffer = cursor.bind_buffer(buffer)?;
 ///     // Fetch data batch by batch
@@ -101,11 +118,36 @@ impl<'s> CursorRow<'s> {
     }
 }
 
-impl<'s> CursorRow<'s> {
+impl CursorRow<'_> {
     /// Fills a suitable target buffer with a field from the current row of the result set. This
     /// method drains the data from the field. It can be called repeatedly to if not all the data
     /// fit in the output buffer at once. It should not called repeatedly to fetch the same value
     /// twice. Column index starts at `1`.
+    ///
+    /// You can use [`crate::Nullable`] to fetch nullable values.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use odbc_api::{Cursor, Error, Nullable};
+    /// # fn fetch_values_example(cursor: &mut impl Cursor) -> Result<(), Error> {
+    /// // Declare nullable value to fetch value into. ODBC values layout is different from Rusts
+    /// // option. We can not use `Option<i32>` directly.
+    /// let mut field = Nullable::<i32>::null();
+    /// // Move cursor to next row
+    /// let mut row = cursor.next_row()?.unwrap();
+    /// // Fetch first column into field
+    /// row.get_data(1, &mut field)?;
+    /// // Convert nullable value to Option for convinience
+    /// let field = field.into_opt();
+    /// if let Some(value) = field {
+    ///     println!("Value: {}", value);
+    /// } else {
+    ///     println!("Value is NULL");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn get_data(
         &mut self,
         col_or_param_num: u16,
@@ -136,8 +178,11 @@ impl<'s> CursorRow<'s> {
     /// use odbc_api::{Connection, Error, IntoParameter, Cursor};
     ///
     /// fn get_large_text(name: &str, conn: &mut Connection<'_>) -> Result<Option<String>, Error> {
+    ///     let query = "SELECT content FROM LargeFiles WHERE name=?";
+    ///     let parameters = &name.into_parameter();
+    ///     let timeout_sec = None;
     ///     let mut cursor = conn
-    ///         .execute("SELECT content FROM LargeFiles WHERE name=?", &name.into_parameter())?
+    ///         .execute(query, parameters, timeout_sec)?
     ///         .expect("Assume select statement creates cursor");
     ///     if let Some(mut row) = cursor.next_row()? {
     ///         let mut buf = Vec::new();
@@ -283,18 +328,22 @@ impl<'s> CursorRow<'s> {
 /// Cursors are used to process and iterate the result sets returned by executing queries. Created
 /// by either a prepared query or direct execution. Usually utilized through the [`crate::Cursor`]
 /// trait.
-pub struct CursorImpl<Stmt: AsStatementRef> {
+#[derive(Debug)]
+pub struct CursorImpl<Stmt: Statement> {
     /// A statement handle in cursor mode.
     statement: Stmt,
 }
 
 impl<S> Drop for CursorImpl<S>
 where
-    S: AsStatementRef,
+    S: Statement,
 {
     fn drop(&mut self) {
-        let mut stmt = self.statement.as_stmt_ref();
-        if let Err(e) = stmt.close_cursor().into_result(&stmt) {
+        if let Err(e) = self
+            .statement
+            .end_cursor_scope()
+            .into_result(&self.statement)
+        {
             // Avoid panicking, if we already have a panic. We don't want to mask the original
             // error.
             if !panicking() {
@@ -306,18 +355,18 @@ where
 
 impl<S> AsStatementRef for CursorImpl<S>
 where
-    S: AsStatementRef,
+    S: Statement,
 {
     fn as_stmt_ref(&mut self) -> StatementRef<'_> {
         self.statement.as_stmt_ref()
     }
 }
 
-impl<S> ResultSetMetadata for CursorImpl<S> where S: AsStatementRef {}
+impl<S> ResultSetMetadata for CursorImpl<S> where S: Statement {}
 
 impl<S> Cursor for CursorImpl<S>
 where
-    S: AsStatementRef,
+    S: Statement,
 {
     fn bind_buffer<B>(mut self, mut row_set_buffer: B) -> Result<BlockCursor<Self, B>, Error>
     where
@@ -336,9 +385,9 @@ where
     {
         // Consume self without calling drop to avoid calling close_cursor.
         let mut statement = self.into_stmt();
-        let mut stmt = statement.as_stmt_ref();
 
-        let has_another_result = unsafe { stmt.more_results() }.into_result_bool(&stmt)?;
+        let has_another_result =
+            unsafe { statement.more_results() }.into_result_bool(&statement)?;
         let next = if has_another_result {
             Some(CursorImpl { statement })
         } else {
@@ -350,7 +399,7 @@ where
 
 impl<S> CursorImpl<S>
 where
-    S: AsStatementRef,
+    S: Statement,
 {
     /// Users of this library are encouraged not to call this constructor directly but rather invoke
     /// [`crate::Connection::execute`] or [`crate::Prepared::execute`] to get a cursor and utilize
@@ -442,288 +491,11 @@ unsafe impl<T: RowSetBuffer> RowSetBuffer for &mut T {
     }
 
     unsafe fn bind_colmuns_to_cursor(&mut self, cursor: StatementRef<'_>) -> Result<(), Error> {
-        (*self).bind_colmuns_to_cursor(cursor)
+        unsafe { (*self).bind_colmuns_to_cursor(cursor) }
     }
 
     fn find_truncation(&self) -> Option<TruncationInfo> {
         (**self).find_truncation()
-    }
-}
-
-/// In order to save on network overhead, it is recommended to use block cursors instead of fetching
-/// values individually. This can greatly reduce the time applications need to fetch data. You can
-/// create a block cursor by binding preallocated memory to a cursor using [`Cursor::bind_buffer`].
-/// A block cursor saves on a lot of IO overhead by fetching an entire set of rows (called *rowset*)
-/// at once into the buffer bound to it. Reusing the same buffer for each rowset also saves on
-/// allocations. A challange with using block cursors might be database schemas with columns there
-/// individual fields can be very large. In these cases developers can choose to:
-///
-/// 1. Reserve less memory for each individual field than the schema indicates and deciding on a
-///    sensible upper bound themselves. This risks truncation of values though, if they are larger
-///    than the upper bound. Using [`BlockCursor::fetch_with_truncation_check`] instead of
-///    [`Cursor::next_row`] your application can detect these truncations. This is usually the best
-///    choice, since individual fields in a table rarely actually take up several GiB of memory.
-/// 2. Calculate the number of rows dynamically based on the maximum expected row size.
-///    [`crate::buffers::BufferDesc::bytes_per_row`], can be helpful with this task.
-/// 3. Not use block cursors and fetch rows slowly with high IO overhead. Calling
-///    [`CursorRow::get_data`] and [`CursorRow::get_text`] to fetch large individual values.
-///
-/// See: <https://learn.microsoft.com/en-us/sql/odbc/reference/develop-app/block-cursors>
-pub struct BlockCursor<C: AsStatementRef, B> {
-    buffer: B,
-    cursor: C,
-}
-
-impl<C, B> BlockCursor<C, B>
-where
-    C: Cursor,
-{
-    fn new(buffer: B, cursor: C) -> Self {
-        Self { buffer, cursor }
-    }
-
-    /// Fills the bound buffer with the next row set.
-    ///
-    /// # Return
-    ///
-    /// `None` if the result set is empty and all row sets have been extracted. `Some` with a
-    /// reference to the internal buffer otherwise.
-    ///
-    /// ```
-    /// use odbc_api::{buffers::TextRowSet, Cursor};
-    ///
-    /// fn print_all_values(mut cursor: impl Cursor) {
-    ///     let batch_size = 100;
-    ///     let max_string_len = 4000;
-    ///     let buffer = TextRowSet::for_cursor(batch_size, &mut cursor, Some(4000)).unwrap();
-    ///     let mut cursor = cursor.bind_buffer(buffer).unwrap();
-    ///     // Iterate over batches
-    ///     while let Some(batch) = cursor.fetch().unwrap() {
-    ///         // ... print values in batch ...
-    ///     }
-    /// }
-    /// ```
-    pub fn fetch(&mut self) -> Result<Option<&B>, Error>
-    where
-        B: RowSetBuffer,
-    {
-        self.fetch_with_truncation_check(false)
-    }
-
-    /// Fills the bound buffer with the next row set. Should `error_for_truncation` be `true`and any
-    /// diagnostic indicate truncation of a value an error is returned.
-    ///
-    /// # Return
-    ///
-    /// `None` if the result set is empty and all row sets have been extracted. `Some` with a
-    /// reference to the internal buffer otherwise.
-    ///
-    /// Call this method to find out wether there are any truncated values in the batch, without
-    /// inspecting all its rows and columns.
-    ///
-    /// ```
-    /// use odbc_api::{buffers::TextRowSet, Cursor};
-    ///
-    /// fn print_all_values(mut cursor: impl Cursor) {
-    ///     let batch_size = 100;
-    ///     let max_string_len = 4000;
-    ///     let buffer = TextRowSet::for_cursor(batch_size, &mut cursor, Some(4000)).unwrap();
-    ///     let mut cursor = cursor.bind_buffer(buffer).unwrap();
-    ///     // Iterate over batches
-    ///     while let Some(batch) = cursor.fetch_with_truncation_check(true).unwrap() {
-    ///         // ... print values in batch ...
-    ///     }
-    /// }
-    /// ```
-    pub fn fetch_with_truncation_check(
-        &mut self,
-        error_for_truncation: bool,
-    ) -> Result<Option<&B>, Error>
-    where
-        B: RowSetBuffer,
-    {
-        let mut stmt = self.cursor.as_stmt_ref();
-        unsafe {
-            let result = stmt.fetch();
-            let has_row =
-                error_handling_for_fetch(result, stmt, &self.buffer, error_for_truncation)?;
-            Ok(has_row.then_some(&self.buffer))
-        }
-    }
-
-    /// Unbinds the buffer from the underlying statement handle. Potential usecases for this
-    /// function include.
-    ///
-    /// 1. Binding a different buffer to the "same" cursor after letting it point to the next result
-    ///   set obtained with [Cursor::more_results`].
-    /// 2. Reusing the same buffer with a different statement.
-    pub fn unbind(self) -> Result<(C, B), Error> {
-        // In this method we want to deconstruct self and move cursor out of it. We need to
-        // negotiate with the compiler a little bit though, since BlockCursor does implement `Drop`.
-
-        // We want to move `cursor` out of self, which would make self partially uninitialized.
-        let dont_drop_me = MaybeUninit::new(self);
-        let self_ptr = dont_drop_me.as_ptr();
-
-        // Safety: We know `dont_drop_me` is valid at this point so reading the ptr is okay
-        let mut cursor = unsafe { ptr::read(&(*self_ptr).cursor) };
-        let buffer = unsafe { ptr::read(&(*self_ptr).buffer) };
-
-        // Now that we have cursor out of block cursor, we need to unbind the buffer.
-        unbind_buffer_from_cursor(&mut cursor)?;
-
-        Ok((cursor, buffer))
-    }
-}
-
-impl<C, B> BlockCursor<C, B>
-where
-    B: RowSetBuffer,
-    C: AsStatementRef,
-{
-    /// Maximum amount of rows fetched from the database in the next call to fetch.
-    pub fn row_array_size(&self) -> usize {
-        self.buffer.row_array_size()
-    }
-}
-
-impl<C, B> Drop for BlockCursor<C, B>
-where
-    C: AsStatementRef,
-{
-    fn drop(&mut self) {
-        if let Err(e) = unbind_buffer_from_cursor(&mut self.cursor) {
-            // Avoid panicking, if we already have a panic. We don't want to mask the original
-            // error.
-            if !panicking() {
-                panic!("Unexpected error unbinding columns: {e:?}")
-            }
-        }
-    }
-}
-
-/// The asynchronous sibiling of [`CursorImpl`]. Use this to fetch results in asynchronous code.
-///
-/// Like [`CursorImpl`] this is an ODBC statement handle in cursor state. However unlike its
-/// synchronous sibling this statement handle is in asynchronous polling mode.
-pub struct CursorPolling<Stmt: AsStatementRef> {
-    /// A statement handle in cursor state with asynchronous mode enabled.
-    statement: Stmt,
-}
-
-impl<S> CursorPolling<S>
-where
-    S: AsStatementRef,
-{
-    /// Users of this library are encouraged not to call this constructor directly. This method is
-    /// pubilc so users with an understanding of the raw ODBC C-API have a way to create an
-    /// asynchronous cursor, after they left the safety rails of the Rust type System, in order to
-    /// implement a use case not covered yet, by the safe abstractions within this crate.
-    ///
-    /// # Safety
-    ///
-    /// `statement` must be in Cursor state, for the invariants of this type to hold. Preferable
-    /// `statement` should also have asynchrous mode enabled, otherwise constructing a synchronous
-    /// [`CursorImpl`] is more suitable.
-    pub unsafe fn new(statement: S) -> Self {
-        Self { statement }
-    }
-
-    /// Binds this cursor to a buffer holding a row set.
-    pub fn bind_buffer<B>(
-        mut self,
-        mut row_set_buffer: B,
-    ) -> Result<BlockCursorPolling<Self, B>, Error>
-    where
-        B: RowSetBuffer,
-    {
-        let stmt = self.statement.as_stmt_ref();
-        unsafe {
-            bind_row_set_buffer_to_statement(stmt, &mut row_set_buffer)?;
-        }
-        Ok(BlockCursorPolling::new(row_set_buffer, self))
-    }
-}
-
-impl<S> AsStatementRef for CursorPolling<S>
-where
-    S: AsStatementRef,
-{
-    fn as_stmt_ref(&mut self) -> StatementRef<'_> {
-        self.statement.as_stmt_ref()
-    }
-}
-
-impl<S> Drop for CursorPolling<S>
-where
-    S: AsStatementRef,
-{
-    fn drop(&mut self) {
-        let mut stmt = self.statement.as_stmt_ref();
-        if let Err(e) = stmt.close_cursor().into_result(&stmt) {
-            // Avoid panicking, if we already have a panic. We don't want to mask the original
-            // error.
-            if !panicking() {
-                panic!("Unexpected error closing cursor: {e:?}")
-            }
-        }
-    }
-}
-
-/// Asynchronously iterates in blocks (called row sets) over a result set, filling a buffers with
-/// a lot of rows at once, instead of iterating the result set row by row. This is usually much
-/// faster. Asynchronous sibiling of [`self::BlockCursor`].
-pub struct BlockCursorPolling<C, B>
-where
-    C: AsStatementRef,
-{
-    buffer: B,
-    cursor: C,
-}
-
-impl<C, B> BlockCursorPolling<C, B>
-where
-    C: AsStatementRef,
-{
-    fn new(buffer: B, cursor: C) -> Self {
-        Self { buffer, cursor }
-    }
-
-    /// Fills the bound buffer with the next row set.
-    ///
-    /// # Return
-    ///
-    /// `None` if the result set is empty and all row sets have been extracted. `Some` with a
-    /// reference to the internal buffer otherwise.
-    pub async fn fetch(&mut self, sleep: impl Sleep) -> Result<Option<&B>, Error>
-    where
-        B: RowSetBuffer,
-    {
-        self.fetch_with_truncation_check(false, sleep).await
-    }
-
-    /// Fills the bound buffer with the next row set. Should `error_for_truncation` be `true`and any
-    /// diagnostic indicate truncation of a value an error is returned.
-    ///
-    /// # Return
-    ///
-    /// `None` if the result set is empty and all row sets have been extracted. `Some` with a
-    /// reference to the internal buffer otherwise.
-    ///
-    /// Call this method to find out whether there are any truncated values in the batch, without
-    /// inspecting all its rows and columns.
-    pub async fn fetch_with_truncation_check(
-        &mut self,
-        error_for_truncation: bool,
-        mut sleep: impl Sleep,
-    ) -> Result<Option<&B>, Error>
-    where
-        B: RowSetBuffer,
-    {
-        let mut stmt = self.cursor.as_stmt_ref();
-        let result = unsafe { wait_for(|| stmt.fetch(), &mut sleep).await };
-        let has_row = error_handling_for_fetch(result, stmt, &self.buffer, error_for_truncation)?;
-        Ok(has_row.then_some(&self.buffer))
     }
 }
 
@@ -733,25 +505,70 @@ unsafe fn bind_row_set_buffer_to_statement(
     mut stmt: StatementRef<'_>,
     row_set_buffer: &mut impl RowSetBuffer,
 ) -> Result<(), Error> {
-    stmt.set_row_bind_type(row_set_buffer.bind_type())
-        .into_result(&stmt)?;
-    let size = row_set_buffer.row_array_size();
-    stmt.set_row_array_size(size)
-        .into_result(&stmt)
-        // SAP anywhere has been seen to return with an "invalid attribute" error instead of
-        // a success with "option value changed" info. Let us map invalid attributes during
-        // setting row set array size to something more precise.
-        .provide_context_for_diagnostic(|record, function| {
-            if record.state == State::INVALID_ATTRIBUTE_VALUE {
-                Error::InvalidRowArraySize { record, size }
-            } else {
-                Error::Diagnostics { record, function }
+    unsafe {
+        stmt.set_row_bind_type(row_set_buffer.bind_type())
+            .into_result(&stmt)?;
+        let size = row_set_buffer.row_array_size();
+        let sql_result = stmt.set_row_array_size(size);
+
+        // Search for "option value changed". A QODBC driver reported "option value changed", yet
+        // set the value to `723477590136`. We want to panic if something like this happens.
+        //
+        // See: <https://github.com/pacman82/odbc-api/discussions/742#discussioncomment-13887516>
+        let mut diagnostic_stream = DiagnosticStream::new(&stmt);
+        // We just rememeber that we have seen "option value changed", before asking for the array
+        // size, in order to not mess with other diagnostic records.
+        let mut option_value_changed = false;
+        while let Some(record) = diagnostic_stream.next() {
+            log_diagnostic_record(record);
+            if record.state == State::OPTION_VALUE_CHANGED {
+                option_value_changed = true;
             }
-        })?;
-    stmt.set_num_rows_fetched(row_set_buffer.mut_num_fetch_rows())
-        .into_result(&stmt)?;
-    row_set_buffer.bind_colmuns_to_cursor(stmt)?;
-    Ok(())
+        }
+        if option_value_changed {
+            // Now rejecting a too large buffer size is save, but not if the value is something
+            // even larger after. Zero is also suspicious.
+            let actual_size = stmt.row_array_size().into_result(&stmt)?;
+            #[cfg(not(feature = "structured_logging"))]
+            warn!(
+                "Row array size set by the driver to: {actual_size}. Desired size had been: {size}"
+            );
+            #[cfg(feature = "structured_logging")]
+            warn!(
+                target: "odbc_api",
+                requested = size,
+                actual = actual_size;
+                "Row array size overridden by driver"
+            );
+            if actual_size > size || actual_size == 0 {
+                panic!(
+                    "Your ODBC buffer changed the array size for bulk fetchin in an unsound way. \
+                    To prevent undefined behavior the application must panic. You can try \
+                    different batch sizes for bulk fetching, or report a bug with your ODBC driver \
+                    provider. This behavior has been observed with QODBC drivers. If you are using \
+                    one try fetching row by row rather than the faster bulk fetch."
+                )
+            }
+        }
+
+        sql_result
+            // We already logged diagnostic records then we were looking for Option value changed
+            .into_result_without_logging(&stmt)
+            // SAP anywhere has been seen to return with an "invalid attribute" error instead of
+            // a success with "option value changed" info. Let us map invalid attributes during
+            // setting row set array size to something more precise.
+            .provide_context_for_diagnostic(|record, function| {
+                if record.state == State::INVALID_ATTRIBUTE_VALUE {
+                    Error::InvalidRowArraySize { record, size }
+                } else {
+                    Error::Diagnostics { record, function }
+                }
+            })?;
+        stmt.set_num_rows_fetched(row_set_buffer.mut_num_fetch_rows())
+            .into_result(&stmt)?;
+        row_set_buffer.bind_colmuns_to_cursor(stmt)?;
+        Ok(())
+    }
 }
 
 /// Error handling for bulk fetching is shared between synchronous and asynchronous usecase.
@@ -767,22 +584,23 @@ fn error_handling_for_fetch(
     // record to be there, as the driver could generate a large amount of diagnostic records,
     // while we are limited in the amount we can check. The second check serves as an optimization
     // for the happy path.
-    if error_for_truncation && result == SqlResult::SuccessWithInfo(()) {
-        if let Some(TruncationInfo {
+    if error_for_truncation
+        && result == SqlResult::SuccessWithInfo(())
+        && let Some(TruncationInfo {
             indicator,
             buffer_index,
         }) = buffer.find_truncation()
-        {
-            return Err(Error::TooLargeValueForBuffer {
-                indicator,
-                buffer_index,
-            });
-        }
+    {
+        return Err(Error::TooLargeValueForBuffer {
+            indicator,
+            buffer_index,
+        });
     }
 
     let has_row = result
         .on_success(|| true)
-        .into_result_with(&stmt.as_stmt_ref(), Some(false), None)
+        .on_no_data(|| false)
+        .into_result(&stmt.as_stmt_ref())
         // Oracle's ODBC driver does not support 64Bit integers. Furthermore, it does not
         // tell it to the user when binding parameters, but rather now then we fetch
         // results. The error code returned is `HY004` rather than `HY003` which should
@@ -795,21 +613,6 @@ fn error_handling_for_fetch(
             }
         })?;
     Ok(has_row)
-}
-
-impl<C, B> Drop for BlockCursorPolling<C, B>
-where
-    C: AsStatementRef,
-{
-    fn drop(&mut self) {
-        if let Err(e) = unbind_buffer_from_cursor(&mut self.cursor) {
-            // Avoid panicking, if we already have a panic. We don't want to mask the original
-            // error.
-            if !panicking() {
-                panic!("Unexpected error unbinding columns: {e:?}")
-            }
-        }
-    }
 }
 
 /// Unbinds buffer and num_rows_fetched from the cursor. This implementation is shared between

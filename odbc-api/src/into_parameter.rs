@@ -1,13 +1,13 @@
-use widestring::{U16Str, U16String};
+use widestring::{Utf16Str, Utf16String};
 
 use crate::{
+    Nullable,
     buffers::Indicator,
     fixed_sized::Pod,
     parameter::{InputParameter, VarBinaryBox, VarBinarySlice, VarWCharBox, VarWCharSlice},
-    Nullable,
 };
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 use crate::parameter::{VarCharBox, VarCharSlice};
 
 /// An instance can be consumed and to create a parameter which can be bound to a statement during
@@ -35,7 +35,7 @@ where
     }
 }
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 impl<'a> IntoParameter for &'a str {
     type Parameter = VarCharSlice<'a>;
 
@@ -44,8 +44,8 @@ impl<'a> IntoParameter for &'a str {
     }
 }
 
-#[cfg(not(feature = "narrow"))]
-impl<'a> IntoParameter for &'a str {
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
+impl IntoParameter for &'_ str {
     type Parameter = VarWCharBox;
 
     fn into_parameter(self) -> Self::Parameter {
@@ -59,15 +59,18 @@ impl<'a> IntoParameter for Option<&'a str> {
     fn into_parameter(self) -> Self::Parameter {
         match self {
             Some(str) => str.into_parameter(),
-            #[cfg(feature = "narrow")]
+            #[cfg(not(any(
+                feature = "wide",
+                all(not(feature = "narrow"), target_os = "windows")
+            )))]
             None => VarCharSlice::NULL,
-            #[cfg(not(feature = "narrow"))]
+            #[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
             None => VarWCharBox::null(),
         }
     }
 }
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 impl IntoParameter for String {
     type Parameter = VarCharBox;
 
@@ -76,7 +79,7 @@ impl IntoParameter for String {
     }
 }
 
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 impl IntoParameter for String {
     type Parameter = VarWCharBox;
 
@@ -91,9 +94,12 @@ impl IntoParameter for Option<String> {
     fn into_parameter(self) -> Self::Parameter {
         match self {
             Some(str) => str.into_parameter(),
-            #[cfg(feature = "narrow")]
+            #[cfg(not(any(
+                feature = "wide",
+                all(not(feature = "narrow"), target_os = "windows")
+            )))]
             None => VarCharBox::null(),
-            #[cfg(not(feature = "narrow"))]
+            #[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
             None => VarWCharBox::null(),
         }
     }
@@ -137,20 +143,20 @@ impl IntoParameter for Option<Vec<u8>> {
     }
 }
 
-impl<'a> IntoParameter for &'a U16Str {
+impl<'a> IntoParameter for &'a Utf16Str {
     type Parameter = VarWCharSlice<'a>;
 
-    fn into_parameter(self) -> Self::Parameter {
+    fn into_parameter(self) -> VarWCharSlice<'a> {
         let slice = self.as_slice();
         let length_in_bytes = slice.len() * 2;
         VarWCharSlice::from_buffer(slice, Indicator::Length(length_in_bytes))
     }
 }
 
-impl<'a> IntoParameter for Option<&'a U16Str> {
+impl<'a> IntoParameter for Option<&'a Utf16Str> {
     type Parameter = VarWCharSlice<'a>;
 
-    fn into_parameter(self) -> Self::Parameter {
+    fn into_parameter(self) -> VarWCharSlice<'a> {
         match self {
             Some(str) => str.into_parameter(),
             None => VarWCharSlice::NULL,
@@ -158,15 +164,15 @@ impl<'a> IntoParameter for Option<&'a U16Str> {
     }
 }
 
-impl IntoParameter for U16String {
+impl IntoParameter for Utf16String {
     type Parameter = VarWCharBox;
 
     fn into_parameter(self) -> Self::Parameter {
-        VarWCharBox::from_u16_string(self)
+        VarWCharBox::from_utf16_string(self)
     }
 }
 
-impl IntoParameter for Option<U16String> {
+impl IntoParameter for Option<Utf16String> {
     type Parameter = VarWCharBox;
 
     fn into_parameter(self) -> Self::Parameter {

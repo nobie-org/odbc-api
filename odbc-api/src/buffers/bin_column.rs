@@ -1,23 +1,27 @@
+use super::{ColumnBuffer, Indicator, Resize, Slice};
+
 use crate::{
-    buffers::Indicator,
+    DataType, Error,
     columnar_bulk_inserter::BoundInputSlice,
     error::TooLargeBufferSize,
     handles::{CData, CDataMut, HasDataType, Statement, StatementRef},
-    DataType, Error,
 };
 
-use log::debug;
+use log::trace;
 use odbc_sys::{CDataType, NULL_DATA};
 use std::{cmp::min, ffi::c_void, num::NonZeroUsize};
 
 /// A buffer intended to be bound to a column of a cursor. Elements of the buffer will contain a
 /// variable amount of bytes up to a maximum length. Since elements of this type have variable
 /// length an additional indicator buffer is also maintained, whether the column is nullable or not.
-/// Therefore this buffer type is used for variable sized binary data whether it is nullable or not.
+/// Therefore this buffer type is used for variable-sized binary data, whether it is nullable or
+/// not.
 #[derive(Debug)]
 pub struct BinColumn {
     /// Maximum element length.
     max_len: usize,
+    /// Consequitive bytes for all the elements in the buffer. We can find the first byte of the
+    /// n-th elment at `n * max_len`.
     values: Vec<u8>,
     /// Elements in this buffer are either `NULL_DATA` or hold the length of the element in value
     /// with the same index. Please note that this value may be larger than `max_len` if the value
@@ -101,23 +105,6 @@ impl BinColumn {
         }
     }
 
-    /// `Some` if any value is truncated in the range [0, num_rows).
-    ///
-    /// After fetching data we may want to know if any value has been truncated due to the buffer
-    /// not being able to hold elements of that size. This method checks the indicator buffer
-    /// element wise and reports one indicator which indicates a size large than the maximum element
-    /// size, if it exits.
-    pub fn has_truncated_values(&self, num_rows: usize) -> Option<Indicator> {
-        self.indicators
-            .iter()
-            .copied()
-            .take(num_rows)
-            .find_map(|indicator| {
-                let indicator = Indicator::from_isize(indicator);
-                indicator.is_truncated(self.max_len).then_some(indicator)
-            })
-    }
-
     /// Changes the maximum element length the buffer can hold. This operation is useful if you find
     /// an unexpected large input during insertion. All values in the buffer will be set to NULL.
     ///
@@ -146,8 +133,8 @@ impl BinColumn {
     /// not guarantee the accessed element to be valid and in a defined state. It also can not panic
     /// on accessing an undefined element. It will panic however if `row_index` is larger or equal
     /// to the maximum number of elements in the buffer.
-    pub fn view(&self, num_rows: usize) -> BinColumnView<'_> {
-        BinColumnView {
+    pub fn view(&self, num_rows: usize) -> BinColumnSlice<'_> {
+        BinColumnSlice {
             num_rows,
             col: self,
         }
@@ -198,9 +185,18 @@ impl BinColumn {
     /// * `new_max_len`: New maximum element length in bytes.
     /// * `num_rows`: Number of valid rows currently stored in this buffer.
     pub fn resize_max_element_length(&mut self, new_max_len: usize, num_rows: usize) {
-        debug!(
+        #[cfg(not(feature = "structured_logging"))]
+        trace!(
             "Rebinding binary column buffer with {} elements. Maximum length {} => {}",
             num_rows, self.max_len, new_max_len
+        );
+        #[cfg(feature = "structured_logging")]
+        trace!(
+            target: "odbc_api",
+            num_rows = num_rows,
+            old_max_len = self.max_len,
+            new_max_len = new_max_len;
+            "Binary column buffer resized"
         );
 
         let batch_size = self.indicators.len();
@@ -257,11 +253,6 @@ impl BinColumn {
             self.indicators[index] = NULL_DATA;
         }
     }
-
-    /// Maximum number of elements this buffer can hold.
-    pub fn capacity(&self) -> usize {
-        self.indicators.len()
-    }
 }
 
 unsafe impl<'a> BoundInputSlice<'a> for BinColumn {
@@ -290,7 +281,7 @@ pub struct BinColumnSliceMut<'a> {
     parameter_index: u16,
 }
 
-impl<'a> BinColumnSliceMut<'a> {
+impl BinColumnSliceMut<'_> {
     /// Sets the value of the buffer at index at Null or the specified binary Text. This method will
     /// panic on out of bounds index, or if input holds a text which is larger than the maximum
     /// allowed element length. `element` must be specified without the terminating zero.
@@ -324,12 +315,12 @@ impl<'a> BinColumnSliceMut<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct BinColumnView<'c> {
+pub struct BinColumnSlice<'c> {
     num_rows: usize,
     col: &'c BinColumn,
 }
 
-impl<'c> BinColumnView<'c> {
+impl<'c> BinColumnSlice<'c> {
     /// The number of valid elements in the text column.
     pub fn len(&self) -> usize {
         self.num_rows
@@ -364,6 +355,17 @@ impl<'c> BinColumnView<'c> {
     }
 }
 
+unsafe impl Slice for BinColumn {
+    type Slice<'a> = BinColumnSlice<'a>;
+
+    fn slice(&self, valid_rows: usize) -> Self::Slice<'_> {
+        BinColumnSlice {
+            num_rows: valid_rows,
+            col: self,
+        }
+    }
+}
+
 /// Iterator over a binary column. See [`crate::buffers::BinColumn`]
 #[derive(Debug)]
 pub struct BinColumnIt<'c> {
@@ -391,7 +393,7 @@ impl<'c> Iterator for BinColumnIt<'c> {
     }
 }
 
-impl<'c> ExactSizeIterator for BinColumnIt<'c> {}
+impl ExactSizeIterator for BinColumnIt<'_> {}
 
 unsafe impl CData for BinColumn {
     fn cdata_type(&self) -> CDataType {
@@ -429,13 +431,39 @@ unsafe impl CDataMut for BinColumn {
     }
 }
 
+impl Resize for BinColumn {
+    fn resize(&mut self, new_capacity: usize) {
+        self.values.resize(new_capacity * self.max_len, 0);
+        self.indicators.resize(new_capacity, NULL_DATA);
+    }
+}
+
+unsafe impl ColumnBuffer for BinColumn {
+    fn capacity(&self) -> usize {
+        self.indicators.len()
+    }
+
+    fn has_truncated_values(&self, num_rows: usize) -> Option<Indicator> {
+        self.indicators
+            .iter()
+            .copied()
+            .take(num_rows)
+            .find_map(|indicator| {
+                let indicator = Indicator::from_isize(indicator);
+                indicator.is_truncated(self.max_len).then_some(indicator)
+            })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::error::TooLargeBufferSize;
 
-    use super::BinColumn;
+    use super::{BinColumn, Resize};
 
     #[test]
+    #[ignore = "On windows this tests does cause containerized linux and WSL to allocate all \
+        memory instead of triggering a failed allocation."]
     fn allocating_too_big_a_binary_column() {
         let two_gib = 2_147_483_648;
         let result = BinColumn::try_new(10_000, two_gib);
@@ -447,5 +475,25 @@ mod test {
                 element_size: 2_147_483_648
             }
         ))
+    }
+
+    #[test]
+    fn resize_binary_column_buffer() {
+        // Given a binary column with 2 elements
+        let mut column = BinColumn::new(2, 10);
+        column.set_value(0, Some(b"Hello"));
+        column.set_value(1, Some(b"World"));
+
+        // When resizing the column to 3 elements
+        column.resize(3);
+
+        // Then
+        // the max element size is unchanged
+        assert_eq!(column.max_len(), 10);
+        // the values are still there
+        assert_eq!(column.value_at(0), Some(b"Hello".as_slice()));
+        assert_eq!(column.value_at(1), Some(b"World".as_slice()));
+        // the third element is None
+        assert_eq!(column.value_at(2), None);
     }
 }

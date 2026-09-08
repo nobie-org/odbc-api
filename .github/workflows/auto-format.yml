@@ -1,0 +1,29 @@
+name: Auto Format
+
+on: [push, pull_request]
+
+jobs:
+  format:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Run formatter
+        run: cargo fmt
+      - name: Commit changes
+        run: |
+          if [[ `git status --porcelain` ]]; then
+            git config user.name "github-actions[bot]"
+            # Make formatting commits look lie they'r authored by the official github-actions[bot]
+            # instead of an anonymous user account.
+            # For the id see: https://api.github.com/users/github-actions%5Bbot%5D
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "style: formattig"
+            git push
+          fi

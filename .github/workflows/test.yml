@@ -1,55 +1,46 @@
 name: Build and test
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
   win64:
-    name: Build & Test Win64
+    name: Test on Windows 64
     runs-on: windows-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install latests rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
         with:
           toolchain: stable
           target: x86_64-pc-windows-msvc
           default: true
           override: true
 
-      # Extract all files from installer
       - name: Install SQLite drivers
         run: |
-         Invoke-WebRequest http://www.ch-werner.de/sqliteodbc/sqliteodbc_w64.exe -OutFile C:\sqliteodbc.exe
-         7z x C:\sqliteodbc.exe -o"C:\Program Files\SQLite ODBC Driver for Win64"
-         REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers" /v "SQLite3 ODBC Driver" /t REG_SZ /d Installed /f
-         REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\SQLite3 ODBC Driver" /v "Driver" /t REG_SZ /d "C:\Program Files\SQLite ODBC Driver for Win64\sqlite3odbc.dll" /f
-         REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\SQLite3 ODBC Driver" /v "Setup" /t REG_SZ /d "C:\Program Files\SQLite ODBC Driver for Win64\sqlite3odbc.dll" /f
-         REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\SQLite3 ODBC Driver" /v "UsageCount" /t REG_DWORD /d 1
-
-      # Databases need to be run independently because docker on win64 doesn't support
-      # linux containers
-      - name: Run Microsoft SQL Server
-        uses: potatoqualitee/mssqlsuite@v1
-        with:
-          install: sqlengine, sqlclient
-          sa-password: My@Test@Password1
-          show-log: true
-
-      - name: Setup driver expectations
-        run: cp odbcsv/tests/list-drivers-windows.txt odbcsv/tests/list-drivers.txt
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\SQLite ODBC Driver for Win64"
+          Copy-Item -Path "vendored\sqlite-odbc-win64\sqlite3odbc.dll" -Destination "C:\Program Files\SQLite ODBC Driver for Win64\sqlite3odbc.dll"
+          REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers" /v "SQLite3 ODBC Driver" /t REG_SZ /d Installed /f
+          REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\SQLite3 ODBC Driver" /v "Driver" /t REG_SZ /d "C:\Program Files\SQLite ODBC Driver for Win64\sqlite3odbc.dll" /f
+          REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\SQLite3 ODBC Driver" /v "Setup" /t REG_SZ /d "C:\Program Files\SQLite ODBC Driver for Win64\sqlite3odbc.dll" /f
+          REG ADD "HKLM\SOFTWARE\ODBC\ODBCINST.INI\SQLite3 ODBC Driver" /v "UsageCount" /t REG_DWORD /d 1
 
       # selecting a toolchain either by action or manual `rustup` calls should happen
       # before the plugin, as the cache uses the current rustc version as its cache key
       - name: Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Test
         run: |
-          cargo test --release -- --skip postgresql --skip maria_db --features derive
-          cargo test --features narrow,derive --release -- --skip postgresql --skip maria_db
+          cargo test --lib --features derive -- --skip postgresql --skip maria_db --skip microsoft_sql_server
+          cargo test --lib --features narrow,derive -- --skip postgresql --skip maria_db --skip microsoft_sql_server
 
   win32:
     name: Build Win32
@@ -57,10 +48,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install latests rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
         with:
           toolchain: stable
           target: i686-pc-windows-msvc
@@ -70,7 +61,7 @@ jobs:
       # selecting a toolchain either by action or manual `rustup` calls should happen
       # before the plugin, as the cache uses the current rustc version as its cache key
       - name: Rust build cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build
         run: cargo build --release
@@ -81,15 +72,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install unixODBC
-        run: |
-          brew install unixodbc
-          sudo ln -s /opt/homebrew/lib ~/lib
+        run: brew install unixodbc
 
       - name: Install latests rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
         with:
           toolchain: stable
           default: true
@@ -104,13 +93,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Build test container
-        run: docker-compose --file docker-compose-ci.yml build test_linux
+        run: docker compose --file docker-compose-ci.yml build test_linux
 
       - name: Test
-        run: docker-compose --file docker-compose-ci.yml run test_linux
+        run: docker compose --file docker-compose-ci.yml run test_linux
 
   odbc_3_5:
     name: Check build with ODBC 3.5
@@ -118,11 +107,55 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install latests rust toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
+        with:
+          toolchain: stable
+          default: true
+          override: true
       - name: Build
         run: |
           cd ..
           cargo new test-compilation
           cd test-compilation
           cargo add odbc-api --path ../odbc-api/odbc-api --no-default-features --features odbc_version_3_5
-          cargo build 
+          cargo build
+
+  vendored_unix_odbc_linux:
+    name: Check build with vendored unixODBC on Linux
+    runs-on: ubuntu-latest
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2019-latest
+        ports:
+          - 1433:1433
+        env:
+          ACCEPT_EULA: Y
+          SA_PASSWORD: My@Test@Password1
+
+      postgres:
+        image: postgres:18
+        ports:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: test
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+
+    steps:
+      - name: Install latests rust toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # selecting a toolchain either by action or manual `rustup` calls should happen
+      # before the plugin, as the cache uses the current rustc version as its cache key
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build
+        run: cargo build --features vendored-unix-odbc

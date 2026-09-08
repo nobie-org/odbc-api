@@ -4,8 +4,8 @@
 //! standard to access databases. See the [`guide`] for more information and code
 //! examples.
 
+mod catalog;
 mod columnar_bulk_inserter;
-mod concurrent_block_cursor;
 mod connection;
 mod conversion;
 mod cursor;
@@ -19,10 +19,11 @@ mod narrow;
 mod nullable;
 mod parameter_collection;
 mod preallocated;
+mod preallocated_polling;
 mod prepared;
 mod result_set_metadata;
+mod shared_connection;
 mod sleep;
-mod statement_connection;
 
 pub mod buffers;
 pub mod guide;
@@ -30,36 +31,39 @@ pub mod handles;
 pub mod parameter;
 
 pub use self::{
-    columnar_bulk_inserter::{BoundInputSlice, ColumnarBulkInserter},
-    concurrent_block_cursor::ConcurrentBlockCursor,
-    connection::{escape_attribute_value, Connection, ConnectionOptions},
-    conversion::decimal_text_to_i128,
+    catalog::{ColumnsRow, ForeignKeysRow, PrimaryKeysRow, TablesRow},
+    columnar_bulk_inserter::{
+        BoundInputSlice, ColumnarBulkInserter, InOrder, InputParameterMapping,
+    },
+    connection::{Connection, ConnectionOptions, ConnectionTransitions, escape_attribute_value},
+    conversion::{decimal_text_to_i32, decimal_text_to_i64, decimal_text_to_i128},
     cursor::{
-        BlockCursor, BlockCursorPolling, Cursor, CursorImpl, CursorPolling, CursorRow,
-        RowSetBuffer, TruncationInfo,
+        BlockCursor, BlockCursorIterator, BlockCursorPolling, ConcurrentBlockCursor, Cursor,
+        CursorImpl, CursorPolling, CursorRow, OwnedCursor, RowSetBuffer, TruncationInfo,
     },
     driver_complete_option::DriverCompleteOption,
-    environment::{DataSourceInfo, DriverInfo, Environment},
+    environment::{DataSourceInfo, DriverInfo, Environment, environment},
     error::{Error, TooLargeBufferSize},
-    fixed_sized::Bit,
+    fixed_sized::{Bit, Pod},
     handles::{ColumnDescription, DataType, Nullability},
     into_parameter::IntoParameter,
     narrow::Narrow,
     nullable::Nullable,
     parameter::{InOut, Out, OutputParameter},
     parameter_collection::{ParameterCollection, ParameterCollectionRef, ParameterTupleElement},
-    preallocated::{Preallocated, PreallocatedPolling},
-    prepared::Prepared,
+    preallocated::Preallocated,
+    preallocated_polling::PreallocatedPolling,
+    prepared::{BindParamDesc, Prepared},
     result_set_metadata::ResultSetMetadata,
+    shared_connection::SharedConnection,
     sleep::Sleep,
-    statement_connection::StatementConnection,
 };
 
 /// Reexports `odbc-sys` as sys to enable applications to always use the same version as this
 /// crate.
 pub use odbc_sys as sys;
-pub use widestring::{U16Str, U16String};
+pub use widestring::{Utf16Str, Utf16String};
 
 // Reexport fetch if derive feature is enabled
-#[cfg(feature="derive")]
-pub use odbc_api_derive::Fetch as Fetch;
+#[cfg(feature = "derive")]
+pub use odbc_api_derive::Fetch;

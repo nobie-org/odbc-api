@@ -1,26 +1,36 @@
+use std::cmp::min;
+
 use crate::{
-    buffers::{ColumnBuffer, TextColumn},
+    CursorImpl, Error,
+    buffers::{ColumnBuffer, Resize, TextColumn},
     execute::execute,
     handles::{AsStatementRef, HasDataType, Statement, StatementRef},
-    CursorImpl, Error,
 };
 
-/// Can be used to execute a statement with bulk array paramters. Contrary to its name any statement
-/// with parameters can be executed, not only `INSERT` however inserting large amounts of data in
-/// batches is the primary intended use case.
+/// Can be used to execute a statement with bulk array parameters. Contrary to its name any
+/// statement with parameters can be executed, not only `INSERT`; however, inserting large amounts
+/// of data in batches is the primary intended use case.
 ///
 /// Binding new buffers is quite expensive in ODBC, so the parameter buffers are reused for each
-/// batch (so the pointers bound to the statment stay valid). So we copy each batch of data into the
-/// buffers already bound first rather than binding user defined buffer. Often the data might need
-/// to be transformed anyway, so the copy is no actual overhead. Once the buffers are filled with a
-/// batch, we send the data.
+/// batch (so the pointers bound to the statement stay valid). So we copy each batch of data into
+/// the buffers already bound first rather than binding user-defined buffers. Often the data might
+/// need to be transformed anyway, so the copy is no actual overhead. Once the buffers are filled
+/// with a batch, we send the data.
 pub struct ColumnarBulkInserter<S, C> {
     // We maintain the invariant that the parameters are bound to the statement that parameter set
     // size reflects the number of valid rows in the batch.
     statement: S,
+    /// The number of values within the buffers that should be inserted in the next roundtrip. The
+    /// capacity of the buffers must be equal or larger than this value. The individual buffers
+    /// just hold values. They have no concept of how much values they hold within their capacity.
+    /// We maintain only this one value here for all the column buffers.
     parameter_set_size: usize,
     capacity: usize,
-    /// We maintain the invariant that none of these buffers is truncated.
+    /// We maintain the invariant that none of these buffers is truncated. I.e. indicator values in
+    /// these buffers do not specify values that are larger than the maximum element length of the
+    /// buffer. Some drivers have safeguards against this, but others would just take the length of
+    /// the indicator value to read the value. This would mean reading "random" memory and
+    /// interpreting it as the value. So the kind of thing we try to avoid in a safe abstraction.
     parameters: Vec<C>,
 }
 
@@ -33,33 +43,19 @@ where
     /// # Safety
     ///
     /// * Statement is expected to be a perpared statement.
-    /// * Parameters must all be valid for insertion. An example for an invalid parameter would be
-    ///   a text buffer with a cell those indiactor value exceeds the maximum element length. This
-    ///   can happen after when truncation occurs then writing into a buffer.
-    pub unsafe fn new(mut statement: S, parameters: Vec<C>) -> Result<Self, Error>
+    /// * Parameters must all be valid for insertion. An example for an invalid parameter would be a
+    ///   text buffer with a cell those indiactor value exceeds the maximum element length. This can
+    ///   happen after when truncation occurs then writing into a buffer.
+    pub unsafe fn new(
+        mut statement: S,
+        parameters: Vec<C>,
+        mapping: impl InputParameterMapping,
+    ) -> Result<Self, Error>
     where
-        C: ColumnBuffer + HasDataType,
+        C: ColumnBuffer + HasDataType + Send,
     {
-        let mut stmt = statement.as_stmt_ref();
-        stmt.reset_parameters();
-        let mut parameter_number = 1;
-        // Bind buffers to statement.
-        for column in &parameters {
-            if let Err(error) = stmt
-                .bind_input_parameter(parameter_number, column)
-                .into_result(&stmt)
-            {
-                // This early return using `?` is risky. We actually did bind some parameters
-                // already. We cannot guarantee that the bound pointers stay valid in case of an
-                // error since `Self` is never constructed. We would away with this, if we took
-                // ownership of the statement and it is destroyed should the constructor not
-                // succeed. However columnar bulk inserter can also be instantiated with borrowed
-                // statements. This is why we reset the parameters on error.
-                stmt.reset_parameters();
-                return Err(error);
-            }
-            parameter_number += 1;
-        }
+        let stmt = statement.as_stmt_ref();
+        bind_parameter_buffers_to_statement(&parameters, mapping, stmt)?;
         let capacity = parameters
             .iter()
             .map(|col| col.capacity())
@@ -135,7 +131,7 @@ where
     /// inserts.
     ///
     /// ```no_run
-    /// use odbc_api::{Connection, Error, buffers::BufferDesc};
+    /// use odbc_api::{Connection, Error, BindParamDesc};
     ///
     /// fn insert_birth_years(conn: &Connection, names: &[&str], years: &[i16])
     ///     -> Result<(), Error>
@@ -146,14 +142,14 @@ where
     ///     // Prepare the insert statement
     ///     let prepared = conn.prepare("INSERT INTO Birthdays (name, year) VALUES (?, ?)")?;
     ///     // Create a columnar buffer which fits the input parameters.
-    ///     let buffer_description = [
-    ///         BufferDesc::Text { max_str_len: 255 },
-    ///         BufferDesc::I16 { nullable: false },
+    ///     let param_descriptions = [
+    ///         BindParamDesc::text(255),
+    ///         BindParamDesc::i32(false), // false: not nullable
     ///     ];
     ///     // Here we do everything in one batch. So the capacity is the number of input
     ///     // parameters.
     ///     let capacity = names.len();
-    ///     let mut prebound = prepared.into_column_inserter(capacity, buffer_description)?;
+    ///     let mut prebound = prepared.into_column_inserter(capacity, param_descriptions)?;
     ///     // Set number of input rows in the current batch.
     ///     prebound.set_num_rows(names.len());
     ///     // Fill the buffer with values column by column
@@ -161,7 +157,7 @@ where
     ///     // Fill names
     ///     let mut col = prebound
     ///         .column_mut(0)
-    ///         .as_text_view()
+    ///         .as_text()
     ///         .expect("We know the name column to hold text.");
     ///     for (index, name) in names.iter().map(|s| Some(s.as_bytes())).enumerate() {
     ///         col.set_cell(index, name);
@@ -194,6 +190,77 @@ where
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Resize the buffers to the new capacity. It would be hard to maintain the invariants in case
+    /// of an error, so this is why this method is destroying self in case something goes wrong.
+    ///
+    /// Valid rows in the buffer will be preserved. If the new capacity is smaller than the the
+    /// parameter set size (the number of valid rows in the buffer), then these values will be
+    /// dropped.
+    ///
+    /// You may want to make use of this method in case your program flow reads from a data source
+    /// with varying batch sizes and you want to insert each batch in one roundtrip. If you do not
+    /// know the maximum batch size in advance, you may need to resize the buffers on the fly.
+    ///
+    /// # Parameters
+    ///
+    /// * `new_capacity`: The new capacity of the buffers. Must be at least `1`. May be smaller or
+    ///   larger than the current capacity.
+    /// * `mapping`: The mapping of the input parameters to the column buffers. This should be equal
+    ///   to the mapping used to create the `ColumnarBulkInserter` in the first place. If a mapping
+    ///   has not been specified, explicitly you can use the [`InOrder`] mapping.
+    pub fn resize(
+        mut self,
+        new_capacity: usize,
+        mapping: impl InputParameterMapping,
+    ) -> Result<Self, Error>
+    where
+        C: ColumnBuffer + HasDataType + Resize + Send,
+    {
+        assert!(new_capacity > 0, "New capacity must be at least 1.");
+        // Resize the buffers
+        for column in &mut self.parameters {
+            column.resize(new_capacity);
+        }
+        self.capacity = new_capacity;
+        self.parameter_set_size = min(self.parameter_set_size, new_capacity);
+        // Now the pointers bound to the statement may be invalid, so we need to rebind them.
+        let stmt = self.statement.as_stmt_ref();
+        bind_parameter_buffers_to_statement(&self.parameters, mapping, stmt)?;
+        Ok(self)
+    }
+}
+
+/// Binds the column buffers to the statement, based on the mapping provided. It ensures that only
+/// the provided parameter buffers are bound to the statement. Any previously bound buffers will be
+/// no longer bound. In case of an error no buffers will be bound to the statement.
+fn bind_parameter_buffers_to_statement<C>(
+    parameters: &[C],
+    mapping: impl InputParameterMapping,
+    mut stmt: StatementRef<'_>,
+) -> Result<(), Error>
+where
+    C: ColumnBuffer + HasDataType + Send,
+{
+    stmt.reset_parameters();
+    let parameter_indices = 1..(mapping.num_parameters() as u16 + 1);
+    for parameter_index in parameter_indices {
+        let column_index = mapping.parameter_index_to_column_index(parameter_index);
+        let column_buffer = &parameters[column_index];
+        if let Err(error) =
+            unsafe { stmt.bind_input_parameter(parameter_index, column_buffer) }.into_result(&stmt)
+        {
+            // This early return using `?` is risky. We actually did bind some parameters
+            // already. We cannot guarantee that the bound pointers stay valid in case of an
+            // error since `Self` is never constructed. We would away with this, if we took
+            // ownership of the statement and it is destroyed should the constructor not
+            // succeed. However columnar bulk inserter can also be instantiated with borrowed
+            // statements. This is why we reset the parameters on error.
+            stmt.reset_parameters();
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// You can obtain a mutable slice of a column buffer which allows you to change its contents.
@@ -243,8 +310,7 @@ impl<S> ColumnarBulkInserter<S, TextColumn<u8>> {
             panic!("Trying to insert elements into TextRowSet beyond batch size.")
         }
 
-        let mut col_index = 1;
-        for column in &mut self.parameters {
+        for (col_index, column) in &mut (1..).zip(self.parameters.iter_mut()) {
             let text = row.next().expect(
                 "Row passed to TextRowSet::append must contain one element for each column.",
             );
@@ -258,11 +324,55 @@ impl<S> ColumnarBulkInserter<S, TextColumn<u8>> {
             } else {
                 column.set_value(self.parameter_set_size, None);
             }
-            col_index += 1;
         }
 
         self.parameter_set_size += 1;
 
         Ok(())
+    }
+}
+
+/// Governs how indices of bound buffers map to the indices of the parameters. If the order of the
+/// input buffers matches the order of the placeholders in the SQL statement, then you can just use
+/// [`InOrder`] as the mapping.
+///
+/// Then using array input parameters to determine the values of placeholders in an SQL statement to
+/// be executed the indices of the placeholders and the column buffers may differ. For starters the
+/// column buffer indices are zero based, whereas the parameter indices are one based. On top of
+/// that more complex mappings can emerge if the same input buffer should be reused to fill in for
+/// multiple placeholders. In case the same value would appear in the query twice.
+pub trait InputParameterMapping {
+    fn parameter_index_to_column_index(&self, paramteter_index: u16) -> usize;
+    fn num_parameters(&self) -> usize;
+}
+
+/// An implementation of [`InputParameterMapping`] that should be used if the order of the column
+/// buffers for the array input parameters matches the order of the placeholders in the SQL
+/// Statement.
+pub struct InOrder {
+    /// Corresponds to the number of placeholders in the SQL statement.
+    number_of_parameters: usize,
+}
+
+impl InOrder {
+    /// Creates a new [`InOrder`] mapping for the given number of parameters. The number of
+    /// paremeters is the number of placeholders (`?`) in the SQL statement.
+    pub fn new(number_of_parameters: usize) -> Self {
+        Self {
+            number_of_parameters,
+        }
+    }
+}
+
+impl InputParameterMapping for InOrder {
+    fn parameter_index_to_column_index(&self, paramteter_index: u16) -> usize {
+        debug_assert_ne!(0, paramteter_index, "Parameter index must be one based.");
+        // Each parameter matches exactly one column. Also the column index is zero based, but
+        // parameter indices are one based.
+        (paramteter_index - 1) as usize
+    }
+
+    fn num_parameters(&self) -> usize {
+        self.number_of_parameters
     }
 }

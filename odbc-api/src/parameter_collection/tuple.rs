@@ -2,34 +2,28 @@
 //! trait.
 
 use super::ParameterCollectionRef;
-use crate::{handles::Statement, parameter::InputParameter, Error, InOut, Out, OutputParameter};
-
-macro_rules! impl_bind_parameters {
-    ($offset:expr, $stmt:ident) => (
-        Ok(())
-    );
-    ($offset:expr, $stmt:ident $head:ident $($tail:ident)*) => (
-        {
-            $head.bind_to($offset+1, $stmt)?;
-            impl_bind_parameters!($offset+1, $stmt $($tail)*)
-        }
-    );
-}
+use crate::{Error, InOut, Out, OutputParameter, handles::Statement, parameter::InputParameter};
 
 macro_rules! impl_parameters_for_tuple{
     ($($t:ident)*) => (
-        #[allow(unused_parens)]
-        #[allow(unused_variables)]
-        #[allow(non_snake_case)]
         unsafe impl<$($t:ParameterTupleElement,)*> ParameterCollectionRef for ($($t,)*)
         {
             fn parameter_set_size(&self) -> usize {
                 1
             }
 
+            #[allow(unused_variables, non_snake_case)]
             unsafe fn bind_parameters_to(&mut self, stmt: &mut impl Statement) -> Result<(), Error> {
                 let ($($t,)*) = self;
-                impl_bind_parameters!(0, stmt $($t)*)
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let column_index = 1;
+                    $(
+                        ($t).bind_to(column_index, stmt)?;
+                        let column_index = column_index + 1;
+                    )*
+                }
+                Ok(())
             }
         }
     );
@@ -96,13 +90,12 @@ where
         stmt: &mut impl Statement,
     ) -> Result<(), Error> {
         self.assert_completness();
-        stmt.bind_input_parameter(parameter_number, *self)
-            .into_result(stmt)
+        unsafe { stmt.bind_input_parameter(parameter_number, *self) }.into_result(stmt)
     }
 }
 
 /// Bind mutable references as input/output parameter.
-unsafe impl<'a, T> ParameterTupleElement for InOut<'a, T>
+unsafe impl<T> ParameterTupleElement for InOut<'_, T>
 where
     T: OutputParameter + InputParameter,
 {
@@ -112,13 +105,13 @@ where
         stmt: &mut impl Statement,
     ) -> Result<(), Error> {
         self.0.assert_completness();
-        stmt.bind_parameter(parameter_number, odbc_sys::ParamType::InputOutput, self.0)
+        unsafe { stmt.bind_parameter(parameter_number, odbc_sys::ParamType::InputOutput, self.0) }
             .into_result(stmt)
     }
 }
 
 /// Mutable references wrapped in `Out` are bound as output parameters.
-unsafe impl<'a, T> ParameterTupleElement for Out<'a, T>
+unsafe impl<T> ParameterTupleElement for Out<'_, T>
 where
     T: OutputParameter,
 {
@@ -127,7 +120,7 @@ where
         parameter_number: u16,
         stmt: &mut impl Statement,
     ) -> Result<(), Error> {
-        stmt.bind_parameter(parameter_number, odbc_sys::ParamType::Output, self.0)
+        unsafe { stmt.bind_parameter(parameter_number, odbc_sys::ParamType::Output, self.0) }
             .into_result(stmt)
     }
 }

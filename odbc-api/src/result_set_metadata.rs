@@ -3,8 +3,8 @@ use std::num::NonZeroUsize;
 use odbc_sys::SqlDataType;
 
 use crate::{
-    handles::{slice_to_utf8, AsStatementRef, SqlChar, Statement},
-    ColumnDescription, DataType, Error,
+    ColumnDescription, DataType, Error, Nullability,
+    handles::{AsStatementRef, SqlChar, Statement, slice_to_utf8},
 };
 
 /// Provides Metadata of the resulting the result set. Implemented by `Cursor` types and prepared
@@ -19,16 +19,16 @@ pub trait ResultSetMetadata: AsStatementRef {
     /// # Parameters
     ///
     /// * `column_number`: Column index. `0` is the bookmark column. The other column indices start
-    /// with `1`.
+    ///   with `1`.
     /// * `column_description`: Holds the description of the column after the call. This method does
-    /// not provide strong exception safety as the value of this argument is undefined in case of an
-    /// error.
+    ///   not provide strong exception safety as the value of this argument is undefined in case of
+    ///   an error.
     fn describe_col(
         &mut self,
         column_number: u16,
         column_description: &mut ColumnDescription,
     ) -> Result<(), Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.describe_col(column_number, column_description)
             .into_result(&stmt)
     }
@@ -40,7 +40,7 @@ pub trait ResultSetMetadata: AsStatementRef {
     /// See also:
     /// <https://docs.microsoft.com/en-us/sql/odbc/reference/syntax/sqlnumresultcols-function>
     fn num_result_cols(&mut self) -> Result<i16, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.num_result_cols().into_result(&stmt)
     }
 
@@ -49,7 +49,7 @@ pub trait ResultSetMetadata: AsStatementRef {
     ///
     /// `column_number`: Index of the column, starting at 1.
     fn column_is_unsigned(&mut self, column_number: u16) -> Result<bool, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.is_unsigned_column(column_number).into_result(&stmt)
     }
 
@@ -58,7 +58,7 @@ pub trait ResultSetMetadata: AsStatementRef {
     ///
     /// `column_number`: Index of the column, starting at 1.
     fn col_octet_length(&mut self, column_number: u16) -> Result<Option<NonZeroUsize>, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.col_octet_length(column_number)
             .into_result(&stmt)
             .map(|signed| NonZeroUsize::new(signed.max(0) as usize))
@@ -69,7 +69,7 @@ pub trait ResultSetMetadata: AsStatementRef {
     ///
     /// `column_number`: Index of the column, starting at 1.
     fn col_display_size(&mut self, column_number: u16) -> Result<Option<NonZeroUsize>, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.col_display_size(column_number)
             .into_result(&stmt)
             // Map negative values to `0`. `0` is used by MSSQL to indicate a missing upper bound
@@ -87,21 +87,32 @@ pub trait ResultSetMetadata: AsStatementRef {
     /// the interval data types that represent a time interval, its value is the applicable
     /// precision of the fractional seconds component.
     fn col_precision(&mut self, column_number: u16) -> Result<isize, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.col_precision(column_number).into_result(&stmt)
     }
 
     /// The applicable scale for a numeric data type. For DECIMAL and NUMERIC data types, this is
     /// the defined scale. It is undefined for all other data types.
     fn col_scale(&mut self, column_number: u16) -> Result<isize, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.col_scale(column_number).into_result(&stmt)
+    }
+
+    /// Nullability of the column.
+    ///
+    /// `column_number`: Index of the column, starting at 1.
+    ///
+    /// See `SQL_DESC_NULLABLE ` in the ODBC reference:
+    /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlcolattribute-function>
+    fn col_nullability(&mut self, column_number: u16) -> Result<Nullability, Error> {
+        let mut stmt = self.as_stmt_ref();
+        stmt.col_nullability(column_number).into_result(&stmt)
     }
 
     /// The column alias, if it applies. If the column alias does not apply, the column name is
     /// returned. If there is no column name or a column alias, an empty string is returned.
     fn col_name(&mut self, column_number: u16) -> Result<String, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         let mut buf = vec![0; 1024];
         stmt.col_name(column_number, &mut buf).into_result(&stmt)?;
         Ok(slice_to_utf8(&buf).unwrap())
@@ -118,7 +129,10 @@ pub trait ResultSetMetadata: AsStatementRef {
     ///
     /// `column_number`: Index of the column, starting at 1.
     fn col_data_type(&mut self, column_number: u16) -> Result<DataType, Error> {
-        let stmt = self.as_stmt_ref();
+        // There is some repetition of knowledge here, about how SqlDataType maps to DataType.
+        // Maybe we can unify this with [`DataType::new`].
+
+        let mut stmt = self.as_stmt_ref();
         let kind = stmt.col_concise_type(column_number).into_result(&stmt)?;
         let dt = match kind {
             SqlDataType::UNKNOWN_TYPE => DataType::Unknown,
@@ -138,6 +152,9 @@ pub trait ResultSetMetadata: AsStatementRef {
                 length: self.col_display_size(column_number)?,
             },
             SqlDataType::EXT_LONG_VARCHAR => DataType::LongVarchar {
+                length: self.col_display_size(column_number)?,
+            },
+            SqlDataType::EXT_W_LONG_VARCHAR => DataType::WLongVarchar {
                 length: self.col_display_size(column_number)?,
             },
             SqlDataType::CHAR => DataType::Char {
@@ -191,10 +208,10 @@ pub trait ResultSetMetadata: AsStatementRef {
 ///
 /// # Parameters
 ///
-/// * `metadata`: Used to query the display size for each column of the row set. For character
-///   data the length in characters is multiplied by 4 in order to have enough space for 4 byte
-///   utf-8 characters. This is a pessimization for some data sources (e.g. SQLite 3) which do
-///   interpret the size of a `VARCHAR(5)` column as 5 bytes rather than 5 characters.
+/// * `metadata`: Used to query the display size for each column of the row set. For character data
+///   the length in characters is multiplied by 4 in order to have enough space for 4 byte utf-8
+///   characters. This is a pessimization for some data sources (e.g. SQLite 3) which do interpret
+///   the size of a `VARCHAR(5)` column as 5 bytes rather than 5 characters.
 pub fn utf8_display_sizes(
     metadata: &mut impl ResultSetMetadata,
 ) -> Result<impl Iterator<Item = Result<Option<NonZeroUsize>, Error>> + '_, Error> {
@@ -245,7 +262,7 @@ where
         if self.column <= self.num_cols {
             // stmt instead of cursor.col_name, so we can efficently reuse the buffer and avoid
             // extra allocations.
-            let stmt = self.cursor.as_stmt_ref();
+            let mut stmt = self.cursor.as_stmt_ref();
 
             let result = stmt
                 .col_name(self.column, &mut self.buffer)

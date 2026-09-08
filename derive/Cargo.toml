@@ -1,7 +1,7 @@
 [package]
 name = "odbc-api-derive"
-version = "7.2.3"
-edition = "2021"
+version = "12.1.1"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/pacman82/odbc-api"
 documentation = "https://docs.rs/odbc-api-derive/"
@@ -31,8 +31,9 @@ readme = "../Readme.md"
 proc-macro = true
 
 [dependencies]
-quote = "1.0.36"
-syn = "2.0.60"
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = "3.0.2"
 
 [dev-dependencies]
 odbc-api = { path = "../odbc-api" }

@@ -1,4 +1,4 @@
-use crate::{handles::Statement, parameter::InputParameter, Error};
+use crate::{Error, handles::Statement, parameter::InputParameter};
 
 mod tuple;
 
@@ -34,7 +34,7 @@ where
     }
 
     unsafe fn bind_parameters_to(&mut self, stmt: &mut impl Statement) -> Result<(), Error> {
-        self.bind_input_parameters_to(stmt)
+        unsafe { self.bind_input_parameters_to(stmt) }
     }
 }
 
@@ -48,7 +48,7 @@ where
 
     unsafe fn bind_input_parameters_to(&self, stmt: &mut impl Statement) -> Result<(), Error> {
         self.assert_completness();
-        stmt.bind_input_parameter(1, self).into_result(stmt)
+        unsafe { stmt.bind_input_parameter(1, self) }.into_result(stmt)
     }
 }
 
@@ -63,8 +63,7 @@ where
     unsafe fn bind_input_parameters_to(&self, stmt: &mut impl Statement) -> Result<(), Error> {
         for (index, parameter) in self.iter().enumerate() {
             parameter.assert_completness();
-            stmt.bind_input_parameter(index as u16 + 1, parameter)
-                .into_result(stmt)?;
+            unsafe { stmt.bind_input_parameter(index as u16 + 1, parameter) }.into_result(stmt)?;
         }
         Ok(())
     }
@@ -89,7 +88,13 @@ where
 ///     ConnectionOptions::default()
 /// )?;
 /// let year = 1980;
-/// if let Some(cursor) = conn.execute("SELECT year, name FROM Birthdays WHERE year > ?;", &year)? {
+/// let timeout = None;
+/// let maybe_cursor = conn.execute(
+///     "SELECT year, name FROM Birthdays WHERE year > ?;",
+///     &year,
+///     timeout,
+/// )?;
+/// if let Some(cursor) = maybe_cursor {
 ///     // Use cursor to process query results.
 /// }
 /// # Ok::<(), odbc_api::Error>(())
@@ -108,9 +113,11 @@ where
 /// )?;
 /// let too_old = 1980;
 /// let too_young = 2000;
+/// let timeout = None;
 /// if let Some(cursor) = conn.execute(
 ///     "SELECT year, name FROM Birthdays WHERE ? < year < ?;",
 ///     (&too_old, &too_young),
+///     timeout,
 /// )? {
 ///     // Use cursor to congratulate only persons in the right age group...
 /// }
@@ -131,9 +138,10 @@ where
 ///     ConnectionOptions::default()
 /// )?;
 /// let params = [1980, 2000];
+/// let timeout = None;
 /// if let Some(cursor) = conn.execute(
 ///     "SELECT year, name FROM Birthdays WHERE ? < year < ?;",
-///     &params[..])?
+///     &params[..], timeout)?
 /// {
 ///     // Use cursor to process query results.
 /// }
@@ -169,7 +177,7 @@ where
     }
 
     unsafe fn bind_parameters_to(&mut self, stmt: &mut impl Statement) -> Result<(), Error> {
-        (**self).bind_parameters_to(stmt)
+        unsafe { (**self).bind_parameters_to(stmt) }
     }
 }
 
@@ -204,6 +212,6 @@ where
     }
 
     unsafe fn bind_parameters_to(&mut self, stmt: &mut impl Statement) -> Result<(), Error> {
-        self.bind_input_parameters_to(stmt)
+        unsafe { self.bind_input_parameters_to(stmt) }
     }
 }

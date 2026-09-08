@@ -1,8 +1,16 @@
+use std::num::NonZeroUsize;
+
 use crate::{
-    buffers::{AnyBuffer, BufferDesc, ColumnBuffer, TextColumn},
+    ColumnarBulkInserter, CursorImpl, DataType, Error, InputParameterMapping,
+    ParameterCollectionRef, ResultSetMetadata,
+    buffers::{BoxColumnBuffer, BufferDesc, ColumnBuffer, TextColumn},
+    columnar_bulk_inserter::InOrder,
     execute::execute_with_parameters,
-    handles::{AsStatementRef, HasDataType, ParameterDescription, Statement, StatementRef},
-    ColumnarBulkInserter, CursorImpl, Error, ParameterCollectionRef, ResultSetMetadata,
+    handles::{
+        ASSUMED_MAX_LENGTH_OF_VARCHAR, ASSUMED_MAX_LENGTH_OF_W_VARCHAR, AsStatementRef, ColumnType,
+        HasDataType, Statement, StatementRef,
+    },
+    parameter::WithDataType,
 };
 
 /// A prepared query. Prepared queries are useful if the similar queries should executed more than
@@ -24,7 +32,7 @@ impl<S> Prepared<S> {
     /// [`crate::handles::StatementImpl::into_sys`] or [`crate::handles::Statement::as_sys`] this
     /// serves as an escape hatch to access the functionality provided by `crate::sys` not yet
     /// accessible through safe abstractions.
-    pub fn into_statement(self) -> S {
+    pub fn into_handle(self) -> S {
         self.statement
     }
 }
@@ -45,7 +53,7 @@ where
         params: impl ParameterCollectionRef,
     ) -> Result<Option<CursorImpl<StatementRef<'_>>>, Error> {
         let stmt = self.statement.as_stmt_ref();
-        execute_with_parameters(move || Ok(stmt), None, params)
+        execute_with_parameters(stmt, None, params)
     }
 
     /// Describes parameter marker associated with a prepared SQL statement.
@@ -54,8 +62,8 @@ where
     ///
     /// * `parameter_number`: Parameter marker number ordered sequentially in increasing parameter
     ///   order, starting at 1.
-    pub fn describe_param(&mut self, parameter_number: u16) -> Result<ParameterDescription, Error> {
-        let stmt = self.as_stmt_ref();
+    pub fn describe_param(&mut self, parameter_number: u16) -> Result<ColumnType, Error> {
+        let mut stmt = self.as_stmt_ref();
 
         stmt.describe_param(parameter_number).into_result(&stmt)
     }
@@ -64,7 +72,7 @@ where
     /// this statement. This is equivalent to the number of placeholders used in the SQL string
     /// used to prepare the statement.
     pub fn num_params(&mut self) -> Result<u16, Error> {
-        let stmt = self.as_stmt_ref();
+        let mut stmt = self.as_stmt_ref();
         stmt.num_params().into_result(&stmt)
     }
 
@@ -73,11 +81,11 @@ where
     /// used to prepare the statement.
     ///
     /// ```
-    /// use odbc_api::{Connection, Error, handles::ParameterDescription};
+    /// use odbc_api::{Connection, Error, handles::ColumnType};
     ///
     /// fn collect_parameter_descriptions(
     ///     connection: Connection<'_>
-    /// ) -> Result<Vec<ParameterDescription>, Error>{
+    /// ) -> Result<Vec<ColumnType>, Error>{
     ///     // Note the two `?` used as placeholders for the parameters.
     ///     let sql = "INSERT INTO NationalDrink (country, drink) VALUES (?, ?)";
     ///     let mut prepared = connection.prepare(sql)?;
@@ -90,31 +98,32 @@ where
     pub fn parameter_descriptions(
         &mut self,
     ) -> Result<
-        impl DoubleEndedIterator<Item = Result<ParameterDescription, Error>>
-            + ExactSizeIterator<Item = Result<ParameterDescription, Error>>
-            + '_,
+        impl DoubleEndedIterator<Item = Result<ColumnType, Error>>
+        + ExactSizeIterator<Item = Result<ColumnType, Error>>
+        + '_,
         Error,
     > {
         Ok((1..=self.num_params()?).map(|index| self.describe_param(index)))
     }
 
     /// Unless you want to roll your own column buffer implementation users are encouraged to use
-    /// [`Self::into_text_inserter`] instead.
+    /// [`Self::into_text_inserter`] or [`Self::into_column_inserter`] instead.
     ///
     /// # Safety
     ///
-    /// * Parameters must all be valid for insertion. An example for an invalid parameter would be
-    ///   a text buffer with a cell those indiactor value exceeds the maximum element length. This
-    ///   can happen after when truncation occurs then writing into a buffer.
+    /// * Parameters must all be valid for insertion. An example for an invalid parameter would be a
+    ///   text buffer with a cell those indiactor value exceeds the maximum element length. This can
+    ///   happen after when truncation occurs then writing into a buffer.
     pub unsafe fn unchecked_bind_columnar_array_parameters<C>(
         self,
         parameter_buffers: Vec<C>,
+        index_mapping: impl InputParameterMapping,
     ) -> Result<ColumnarBulkInserter<S, C>, Error>
     where
-        C: ColumnBuffer + HasDataType,
+        C: ColumnBuffer + HasDataType + Send,
     {
         // We know that statement is a prepared statement.
-        ColumnarBulkInserter::new(self.into_statement(), parameter_buffers)
+        unsafe { ColumnarBulkInserter::new(self.into_handle(), parameter_buffers, index_mapping) }
     }
 
     /// Use this to insert rows of string input into the database.
@@ -130,7 +139,7 @@ where
     ///     let prepared = connection.prepare("INSERT INTO NationalDrink (country, drink) VALUES (?, ?)")?;
     ///     // We assume both parameter inputs never exceed 50 bytes.
     ///     let mut prebound = prepared.into_text_inserter(3, [50, 50])?;
-    ///     
+    ///
     ///     // A cell is an option to byte. We could use `None` to represent NULL but we have no
     ///     // need to do that in this example.
     ///     let as_cell = |s: &'static str| { Some(s.as_bytes()) } ;
@@ -162,18 +171,19 @@ where
         max_str_len: impl IntoIterator<Item = usize>,
     ) -> Result<ColumnarBulkInserter<S, TextColumn<u8>>, Error> {
         let max_str_len = max_str_len.into_iter();
-        let parameter_buffers = max_str_len
+        let parameter_buffers: Vec<_> = max_str_len
             .map(|max_str_len| TextColumn::new(capacity, max_str_len))
             .collect();
+        let index_mapping = InOrder::new(parameter_buffers.len());
         // Text Columns are created with NULL as default, which is valid for insertion.
-        unsafe { self.unchecked_bind_columnar_array_parameters(parameter_buffers) }
+        unsafe { self.unchecked_bind_columnar_array_parameters(parameter_buffers, index_mapping) }
     }
 
     /// A [`crate::ColumnarBulkInserter`] which takes ownership of both the statement and the bound
     /// array parameter buffers.
     ///
     /// ```no_run
-    /// use odbc_api::{Connection, Error, IntoParameter, buffers::BufferDesc};
+    /// use odbc_api::{Connection, Error, IntoParameter, BindParamDesc};
     ///
     /// fn insert_birth_years(
     ///     conn: &Connection,
@@ -186,15 +196,15 @@ where
     ///     let prepared = conn.prepare("INSERT INTO Birthdays (name, year) VALUES (?, ?)")?;
     ///
     ///     // Create a columnar buffer which fits the input parameters.
-    ///     let buffer_description = [
-    ///         BufferDesc::Text { max_str_len: 255 },
-    ///         BufferDesc::I16 { nullable: false },
+    ///     let parameter_descriptions = [
+    ///         BindParamDesc::text(255),
+    ///         BindParamDesc::i16(false),
     ///     ];
     ///     // The capacity must be able to hold at least the largest batch. We do everything in one
     ///     // go, so we set it to the length of the input parameters.
     ///     let capacity = names.len();
     ///     // Allocate memory for the array column parameters and bind it to the statement.
-    ///     let mut prebound = prepared.into_column_inserter(capacity, buffer_description)?;
+    ///     let mut prebound = prepared.into_column_inserter(capacity, parameter_descriptions)?;
     ///     // Length of this batch
     ///     prebound.set_num_rows(capacity);
     ///
@@ -202,7 +212,7 @@ where
     ///     // Fill the buffer with values column by column
     ///     let mut col = prebound
     ///         .column_mut(0)
-    ///         .as_text_view()
+    ///         .as_text()
     ///         .expect("We know the name column to hold text.");
     ///
     ///     for (index, name) in names.iter().enumerate() {
@@ -222,13 +232,36 @@ where
     pub fn into_column_inserter(
         self,
         capacity: usize,
-        descriptions: impl IntoIterator<Item = BufferDesc>,
-    ) -> Result<ColumnarBulkInserter<S, AnyBuffer>, Error> {
-        let parameter_buffers = descriptions
+        descriptions: impl IntoIterator<Item = BindParamDesc>,
+    ) -> Result<ColumnarBulkInserter<S, WithDataType<BoxColumnBuffer>>, Error> {
+        let parameter_buffers: Vec<_> = descriptions
             .into_iter()
-            .map(|desc| AnyBuffer::from_desc(capacity, desc))
+            .map(|desc| desc.make_input_buffer(capacity))
             .collect();
-        unsafe { self.unchecked_bind_columnar_array_parameters(parameter_buffers) }
+        let index_mapping = InOrder::new(parameter_buffers.len());
+        // Safe: We know this to be a valid prepared statement. Also we just created the buffers
+        // to be bound and know them to be empty. => Therfore they are valid and do not contain any
+        // indicator values which would could trigger out of bounds in the database drivers.
+        unsafe { self.unchecked_bind_columnar_array_parameters(parameter_buffers, index_mapping) }
+    }
+
+    /// Similar to [`Self::into_column_inserter`], but allows to specify a custom mapping between
+    /// columns and parameters. This is useful if e.g. the same values a bound to multiple
+    /// parameter placeholders.
+    pub fn into_column_inserter_with_mapping(
+        self,
+        capacity: usize,
+        descriptions: impl IntoIterator<Item = BindParamDesc>,
+        index_mapping: impl InputParameterMapping,
+    ) -> Result<ColumnarBulkInserter<S, WithDataType<BoxColumnBuffer>>, Error> {
+        let parameter_buffers: Vec<_> = descriptions
+            .into_iter()
+            .map(|desc| desc.make_input_buffer(capacity))
+            .collect();
+        // Safe: We know this to be a valid prepared statement. Also we just created the buffers
+        // to be bound and know them to be empty. => Therfore they are valid and do not contain any
+        // indicator values which would could trigger out of bounds in the database drivers.
+        unsafe { self.unchecked_bind_columnar_array_parameters(parameter_buffers, index_mapping) }
     }
 
     /// A [`crate::ColumnarBulkInserter`] which has ownership of the bound array parameter buffers
@@ -240,15 +273,45 @@ where
     pub fn column_inserter(
         &mut self,
         capacity: usize,
-        descriptions: impl IntoIterator<Item = BufferDesc>,
-    ) -> Result<ColumnarBulkInserter<StatementRef<'_>, AnyBuffer>, Error> {
+        descriptions: impl IntoIterator<Item = BindParamDesc>,
+    ) -> Result<ColumnarBulkInserter<StatementRef<'_>, WithDataType<BoxColumnBuffer>>, Error> {
+        // Remark: We repeat the implementation here. It is hard to reuse the
+        // `column_inserter_with_mapping` function, because we need to know the number of parameters
+        // to create the `InOrder` mapping.
         let stmt = self.statement.as_stmt_ref();
 
-        let parameter_buffers = descriptions
+        let parameter_buffers: Vec<_> = descriptions
             .into_iter()
-            .map(|desc| AnyBuffer::from_desc(capacity, desc))
+            .map(|desc| desc.make_input_buffer(capacity))
             .collect();
-        unsafe { ColumnarBulkInserter::new(stmt, parameter_buffers) }
+
+        let index_mapping = InOrder::new(parameter_buffers.len());
+        // Safe: We know that the statement is a prepared statement, and we just created the buffers
+        // to be bound and know them to be empty. => Therfore they are valid and do not contain any
+        // indicator values which would could trigger out of bounds in the database drivers.
+        unsafe { ColumnarBulkInserter::new(stmt, parameter_buffers, index_mapping) }
+    }
+
+    /// Similar to [`Self::column_inserter`], but allows to specify a custom mapping between columns
+    /// and parameters. This is useful if e.g. the same values a bound to multiple parameter
+    /// placeholders.
+    pub fn column_inserter_with_mapping(
+        &mut self,
+        capacity: usize,
+        descriptions: impl IntoIterator<Item = BindParamDesc>,
+        index_mapping: impl InputParameterMapping,
+    ) -> Result<ColumnarBulkInserter<StatementRef<'_>, WithDataType<BoxColumnBuffer>>, Error> {
+        let stmt = self.statement.as_stmt_ref();
+
+        let parameter_buffers: Vec<_> = descriptions
+            .into_iter()
+            .map(|desc| desc.make_input_buffer(capacity))
+            .collect();
+
+        // Safe: We know that the statement is a prepared statement, and we just created the buffers
+        // to be bound and know them to be empty. => Therfore they are valid and do not contain any
+        // indicator values which would could trigger out of bounds in the database drivers.
+        unsafe { ColumnarBulkInserter::new(stmt, parameter_buffers, index_mapping) }
     }
 
     /// Number of rows affected by the last `INSERT`, `UPDATE` or `DELETE` statement. May return
@@ -279,7 +342,7 @@ where
     /// }
     /// ```
     pub fn row_count(&mut self) -> Result<Option<usize>, Error> {
-        let stmt = self.statement.as_stmt_ref();
+        let mut stmt = self.statement.as_stmt_ref();
         stmt.row_count().into_result(&stmt).map(|count| {
             // ODBC returns -1 in case a row count is not available
             if count == -1 {
@@ -288,6 +351,327 @@ where
                 Some(count.try_into().unwrap())
             }
         })
+    }
+
+    /// Use this to limit the time the query is allowed to take, before responding with data to the
+    /// application. The driver may replace the number of seconds you provide with a minimum or
+    /// maximum value. You can specify ``0``, to deactivate the timeout, this is the default. For
+    /// this to work the driver must support this feature. E.g. PostgreSQL, and Microsoft SQL Server
+    /// do, but SQLite or MariaDB do not.
+    ///
+    /// This corresponds to `SQL_ATTR_QUERY_TIMEOUT` in the ODBC C API.
+    ///
+    /// See:
+    /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetstmtattr-function>
+    pub fn set_query_timeout_sec(&mut self, timeout_sec: usize) -> Result<(), Error> {
+        let mut stmt = self.statement.as_stmt_ref();
+        stmt.set_query_timeout_sec(timeout_sec).into_result(&stmt)
+    }
+
+    /// The number of seconds to wait for a SQL statement to execute before returning to the
+    /// application. If `timeout_sec` is equal to 0 (default), there is no timeout.
+    ///
+    /// This corresponds to `SQL_ATTR_QUERY_TIMEOUT` in the ODBC C API.
+    ///
+    /// See:
+    /// <https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetstmtattr-function>
+    pub fn query_timeout_sec(&mut self) -> Result<usize, Error> {
+        let mut stmt = self.statement.as_stmt_ref();
+        stmt.query_timeout_sec().into_result(&stmt)
+    }
+}
+
+/// Description of paramater domain and buffer bound for bulk insertion. Used by
+/// [`Prepared::column_inserter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindParamDesc {
+    /// Describes the C-Type used to describe values and wether we need a NULL representation.
+    pub buffer_desc: BufferDesc,
+    /// The relational type or domain of the parameter. While there is a strong correllation between
+    /// the buffer used and the relational type, it is not always a naive mapping. E.g. a text buffer
+    /// can not only carry VARCHAR but also a DECIMAL or a timestamp.
+    pub data_type: DataType,
+}
+
+impl BindParamDesc {
+    /// A description for binding utf-16 data to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `max_str_len`: The maximum length of the string in utf-16 code units. Excluding
+    ///   terminating null character.
+    ///
+    /// Uses a wide character buffer and sets the data type to [`DataType::WVarchar`] or
+    /// [`DataType::WLongVarchar`].
+    pub fn wide_text(max_str_len: usize) -> Self {
+        let data_type = if max_str_len <= ASSUMED_MAX_LENGTH_OF_W_VARCHAR {
+            DataType::WVarchar {
+                length: NonZeroUsize::new(max_str_len),
+            }
+        } else {
+            DataType::WLongVarchar {
+                length: NonZeroUsize::new(max_str_len),
+            }
+        };
+        BindParamDesc {
+            buffer_desc: BufferDesc::WText { max_str_len },
+            data_type,
+        }
+    }
+
+    /// A description for binding narrow text (usually utf-8) data to a parameter.
+    ///
+    /// * `max_str_len`: The maximum length of the string in bytes. excluding terminating null
+    ///   character.
+    ///
+    /// Uses a narrow character buffer and sets the data type to [`DataType::Varchar`] or
+    /// [`DataType::LongVarchar`].
+    pub fn text(max_str_len: usize) -> Self {
+        let data_type = if max_str_len <= ASSUMED_MAX_LENGTH_OF_VARCHAR {
+            DataType::Varchar {
+                length: NonZeroUsize::new(max_str_len),
+            }
+        } else {
+            DataType::LongVarchar {
+                length: NonZeroUsize::new(max_str_len),
+            }
+        };
+        BindParamDesc {
+            buffer_desc: BufferDesc::Text { max_str_len },
+            data_type,
+        }
+    }
+
+    /// A description for binding timestamps to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    /// * `precision`: The number of digits for the fractional seconds part. E.g. if you know your
+    ///   input to be milliseconds choose `3`. Many databases error if you exceed the maximum
+    ///   precision of the column. If you are unsure about the maximum precision supported by the
+    ///   Database `7` is a good guess.
+    pub fn timestamp(nullable: bool, precision: i16) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::Timestamp { nullable },
+            data_type: DataType::Timestamp { precision },
+        }
+    }
+
+    /// A description for binding [`crate::sys::Time`] values to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn time(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::Time { nullable },
+            data_type: DataType::Time { precision: 0 },
+        }
+    }
+
+    /// A description for binding wallclock time in a text buffer.
+    ///
+    /// # Parameters
+    ///
+    /// * `precision`: The number of digits for the fractional seconds part. E.g. if you know your
+    ///   input to be milliseconds choose `3`. Some databases error if you exceed the maximum
+    ///   precision of the column. If you are unsure about the maximum precision supported by the
+    ///   Database `7` is a good guess.
+    pub fn time_as_text(precision: i16) -> Self {
+        // Text representation of time has a fixed length of 8 (hh:mm:ss) plus the radix character
+        // and the fractional seconds. E.g. for milliseconds we would have `hh:mm:ss.fff` which has
+        // a length of 12.
+        let max_str_len = 8 + if precision > 0 {
+            // Radix character + fractional seconds digits
+            1 + precision as usize
+        } else {
+            0
+        };
+        BindParamDesc {
+            buffer_desc: BufferDesc::Text { max_str_len },
+            data_type: DataType::Time { precision },
+        }
+    }
+
+    /// A description for binding decimal represented as text to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `precision`: The total number of digits in the decimal number. E.g. for `123.45` this
+    ///   would be `5`.
+    /// * `scale`: The number of digits to the right of the decimal point. E.g. for `123.45` this
+    ///   would be `2`.
+    ///
+    pub fn decimal_as_text(precision: u8, scale: i8) -> Self {
+        // Length of a text representation of a decimal
+        let max_str_len = match scale {
+            // Precision digits + (- scale zeroes) + sign
+            i8::MIN..=-1 => (precision as i32 - scale as i32 + 1).try_into().unwrap(),
+            // Precision digits + sign
+            0 => precision as usize + 1,
+            // Precision digits + radix character (`.`) + sign
+            1.. => precision as usize + 1 + 1,
+        };
+        BindParamDesc {
+            buffer_desc: BufferDesc::Text { max_str_len },
+            data_type: DataType::Decimal {
+                precision: precision as usize,
+                scale: scale as i16,
+            },
+        }
+    }
+
+    /// A description for binding 16 bit integers to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn i16(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::I16 { nullable },
+            data_type: DataType::SmallInt,
+        }
+    }
+
+    /// A description for binding 32 bit integers to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn i32(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::I32 { nullable },
+            data_type: DataType::Integer,
+        }
+    }
+
+    /// A description for binding 64 bit integers to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn i64(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::I64 { nullable },
+            data_type: DataType::BigInt,
+        }
+    }
+
+    /// A description for binding variadic binary data to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `max_bytes`: The maximum length of the binary data in bytes.
+    pub fn binary(max_bytes: usize) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::Binary { max_bytes },
+            data_type: DataType::Binary {
+                length: NonZeroUsize::new(max_bytes),
+            },
+        }
+    }
+
+    /// A description for binding `f64` values to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn f64(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::F64 { nullable },
+            data_type: DataType::Double,
+        }
+    }
+
+    /// A description for binding `f32` values to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn f32(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::F32 { nullable },
+            data_type: DataType::Real,
+        }
+    }
+
+    /// A description for binding `u8` values to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn u8(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::U8 { nullable },
+            // Few databases support unsigned types, binding U8 as tiny int might lead to weird
+            // stuff if the database has type is signed. I guess. Let's bind it as SmallInt by
+            // default, just to be on the safe side.
+            data_type: DataType::SmallInt,
+        }
+    }
+
+    /// A description for binding `u8` values to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn i8(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::I8 { nullable },
+            data_type: DataType::TinyInt,
+        }
+    }
+
+    /// A description for binding [`crate::sys::Date`] values to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn date(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::Date { nullable },
+            data_type: DataType::Date,
+        }
+    }
+
+    /// A description for binding [`crate::Bit`] values to a parameter.
+    ///
+    /// # Parameters
+    ///
+    /// * `nullable`: Whether the parameter can be NULL. If `true` null values can be represented,
+    ///   if `false` null values can not be represented, but we can save an allocation for an
+    ///   indicator buffer.
+    pub fn bit(nullable: bool) -> Self {
+        BindParamDesc {
+            buffer_desc: BufferDesc::Bit { nullable },
+            data_type: DataType::Bit,
+        }
+    }
+
+    fn make_input_buffer(&self, max_rows: usize) -> WithDataType<BoxColumnBuffer> {
+        let buffer = self.buffer_desc.column_buffer(max_rows);
+        WithDataType::new(buffer, self.data_type)
     }
 }
 
@@ -299,5 +683,39 @@ where
 {
     fn as_stmt_ref(&mut self) -> StatementRef<'_> {
         self.statement.as_stmt_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::buffers::BufferDesc;
+
+    use super::BindParamDesc;
+
+    #[test]
+    fn bind_paramater_description_decimal_length_positive_scale() {
+        let BufferDesc::Text { max_str_len } = BindParamDesc::decimal_as_text(5, 2).buffer_desc
+        else {
+            panic!("Expected a text buffer for decimal parameters.")
+        };
+        assert_eq!("-123.45".len(), max_str_len);
+    }
+
+    #[test]
+    fn bind_paramater_description_decimal_length_scale_zero() {
+        let BufferDesc::Text { max_str_len } = BindParamDesc::decimal_as_text(5, 0).buffer_desc
+        else {
+            panic!("Expected a text buffer for decimal parameters.")
+        };
+        assert_eq!("-12345".len(), max_str_len);
+    }
+
+    #[test]
+    fn bind_paramater_description_decimal_length_negative_scale() {
+        let BufferDesc::Text { max_str_len } = BindParamDesc::decimal_as_text(5, -2).buffer_desc
+        else {
+            panic!("Expected a text buffer for decimal parameters.")
+        };
+        assert_eq!("-1234500".len(), max_str_len);
     }
 }

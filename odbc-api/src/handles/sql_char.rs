@@ -1,65 +1,77 @@
 //! The idea is to handle most of the conditional compilation around different SQL character types
 //! in this module, so the rest of the crate doesn't have to.
 
+// The rather akward expression:
+// `#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]` is used to
+// annotate things which should only compile if we use UTF-16 to communicate to the data source.
+// We use its negation:
+// `#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]` to
+// indicate a "narrow" charset for communicating with the datasource, which we assume to be UTF-8
+//
+// Currently I did not find a better way to use narrow function on non-windows platforms and wide
+// functions on windows platforms by default. I also want to enable explicitly overwriting the
+// default on both platforms. See also the documentation of the `narrow` and `wide` features in the
+// Cargo.toml manifest.
+
 use super::buffer::{buf_ptr, mut_buf_ptr};
 use std::{
     borrow::Cow,
     mem::{size_of, size_of_val},
 };
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 use std::{ffi::CStr, string::FromUtf8Error};
 
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 use std::{
-    char::{decode_utf16, DecodeUtf16Error},
+    char::{DecodeUtf16Error, decode_utf16},
     marker::PhantomData,
 };
 
-#[cfg(not(feature = "narrow"))]
-use widestring::{U16CStr, U16String};
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
+use widestring::{U16CStr, Utf16String};
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 pub type SqlChar = u8;
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 pub type SqlChar = u16;
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 pub type DecodingError = FromUtf8Error;
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 pub type DecodingError = DecodeUtf16Error;
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 pub fn slice_to_utf8(text: &[u8]) -> Result<String, FromUtf8Error> {
     String::from_utf8(text.to_owned())
 }
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 pub fn slice_to_utf8(text: &[u16]) -> Result<String, DecodeUtf16Error> {
     decode_utf16(text.iter().copied()).collect()
 }
 
-#[cfg(feature = "narrow")]
-pub fn slice_to_cow_utf8(text: &[u8]) -> Cow<str> {
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
+pub fn slice_to_cow_utf8(text: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(text)
 }
-#[cfg(not(feature = "narrow"))]
-pub fn slice_to_cow_utf8(text: &[u16]) -> Cow<str> {
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
+pub fn slice_to_cow_utf8(text: &[u16]) -> Cow<'_, str> {
     let text: Result<String, _> = decode_utf16(text.iter().copied()).collect();
     text.unwrap().into()
 }
 
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 fn sz_to_utf8(buffer: &[u16]) -> String {
     let c_str = U16CStr::from_slice_truncate(buffer).unwrap();
     c_str.to_string_lossy()
 }
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 fn sz_to_utf8(buffer: &[u8]) -> String {
     // Truncate slice at first zero.
     let end = buffer
         .iter()
         .enumerate()
-        .find(|(_index, &character)| character == b'\0')
+        .find(|&(_index, &character)| character == b'\0')
         .expect("Buffer must contain terminating zero.")
         .0;
     let c_str = unsafe { CStr::from_bytes_with_nul_unchecked(&buffer[..=end]) };
@@ -86,7 +98,7 @@ pub fn is_truncated_bin(buffer: &[SqlChar], actual_length_bin: usize) -> bool {
 pub fn resize_to_fit_with_tz(buffer: &mut Vec<SqlChar>, required_binary_length: usize) {
     // In order to use only minimal memory for drivers which stick to the ODBC standard we would
     // use `+1` in the statement beneath. However it turns out the PostgreSQL driver will fill the
-    // last value with `0` instead of the last latter when used with a wide `SqlChar`. So we use
+    // last value with `0` instead of the last letter when used with a wide `SqlChar`. So we use
     // `+2` to make it work with PostgreSql on windows, too.
     buffer.resize((required_binary_length / size_of::<SqlChar>()) + 2, 0);
 }
@@ -103,39 +115,39 @@ pub fn resize_to_fit_without_tz(buffer: &mut Vec<SqlChar>, required_binary_lengt
 /// conversion to narrow method calls, or they are converted to UTF-16, before passed to the wide
 /// methods.
 pub struct SqlText<'a> {
-    /// In case we use wide methods we need to convert to UTF-16. We'll take ownership of the buffer
-    /// here.
-    #[cfg(not(feature = "narrow"))]
-    text: U16String,
+    /// In case we use wide methods we need to convert to UTF-16. We'll take ownership of the
+    /// buffer here.
+    #[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
+    text: Utf16String,
     /// We include the lifetime in the declaration of the type still, so the borrow checker
     /// complains, if we would mess up the compilation for narrow methods.
-    #[cfg(not(feature = "narrow"))]
+    #[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
     _ref: PhantomData<&'a str>,
     /// In the case of narrow compiliation we just forward the string silce unchanged
-    #[cfg(feature = "narrow")]
+    #[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
     text: &'a str,
 }
 
 impl<'a> SqlText<'a> {
-    #[cfg(not(feature = "narrow"))]
+    #[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
     /// Create an SqlText buffer from an UTF-8 string slice
     pub fn new(text: &'a str) -> Self {
         Self {
-            text: U16String::from_str(text),
+            text: Utf16String::from_str(text),
             _ref: PhantomData,
         }
     }
-    #[cfg(feature = "narrow")]
+    #[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
     /// Create an SqlText buffer from an UTF-8 string slice
     pub fn new(text: &'a str) -> Self {
         Self { text }
     }
 
-    #[cfg(not(feature = "narrow"))]
+    #[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
     pub fn ptr(&self) -> *const u16 {
         buf_ptr(self.text.as_slice())
     }
-    #[cfg(feature = "narrow")]
+    #[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
     pub fn ptr(&self) -> *const u8 {
         buf_ptr(self.text.as_bytes())
     }

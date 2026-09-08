@@ -1,21 +1,21 @@
 use super::{
-    as_handle::AsHandle,
+    Connection,
+    any_handle::AnyHandle,
     drop_handle,
     sql_char::SqlChar,
     sql_result::{ExtSqlReturn, SqlResult},
-    Connection,
 };
 use log::debug;
 use odbc_sys::{
-    AttrCpMatch, AttrOdbcVersion, EnvironmentAttribute, FetchOrientation, HDbc, HEnv, Handle,
-    HandleType, SQLAllocHandle, SQLSetEnvAttr,
+    AttrCpMatch, AttrOdbcVersion, EnvironmentAttribute, FetchOrientation, HEnv, Handle, HandleType,
+    SQLAllocHandle, SQLSetEnvAttr,
 };
 use std::ptr::null_mut;
 
-#[cfg(feature = "narrow")]
+#[cfg(not(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows"))))]
 use odbc_sys::{SQLDataSources as sql_data_sources, SQLDrivers as sql_drivers};
 
-#[cfg(not(feature = "narrow"))]
+#[cfg(any(feature = "wide", all(not(feature = "narrow"), target_os = "windows")))]
 use odbc_sys::{SQLDataSourcesW as sql_data_sources, SQLDriversW as sql_drivers};
 
 /// An `Environment` is a global context, in which to access data.
@@ -38,9 +38,9 @@ unsafe impl Send for Environment {}
 // We are not declaring Environment as Sync due to its interior mutability with regards to iterator
 // state and error handilng
 
-unsafe impl AsHandle for Environment {
+unsafe impl AnyHandle for Environment {
     fn as_handle(&self) -> Handle {
-        self.handle as Handle
+        self.handle.as_handle()
     }
 
     fn handle_type(&self) -> HandleType {
@@ -51,7 +51,7 @@ unsafe impl AsHandle for Environment {
 impl Drop for Environment {
     fn drop(&mut self) {
         unsafe {
-            drop_handle(self.handle as Handle, HandleType::Env);
+            drop_handle(self.handle.as_handle(), HandleType::Env);
         }
     }
 }
@@ -70,12 +70,14 @@ impl Environment {
     /// > at any time and is able to connect on one thread, to use the connection on another thread,
     /// > and to disconnect on a third thread.
     pub unsafe fn set_connection_pooling(scheme: odbc_sys::AttrConnectionPooling) -> SqlResult<()> {
-        SQLSetEnvAttr(
-            null_mut(),
-            odbc_sys::EnvironmentAttribute::ConnectionPooling,
-            scheme.into(),
-            odbc_sys::IS_INTEGER,
-        )
+        unsafe {
+            SQLSetEnvAttr(
+                HEnv::null(),
+                odbc_sys::EnvironmentAttribute::ConnectionPooling,
+                scheme.into(),
+                odbc_sys::IS_INTEGER,
+            )
+        }
         .into_sql_result("SQLSetEnvAttr")
     }
 
@@ -101,11 +103,12 @@ impl Environment {
         // however official sources imply it is ok for an application to have multiple environments
         // and I did not get it to race ever on my machine.
         unsafe {
-            let mut handle = null_mut();
-            let result: SqlResult<()> = SQLAllocHandle(HandleType::Env, null_mut(), &mut handle)
-                .into_sql_result("SQLAllocHandle");
+            let mut handle = Handle::null();
+            let result: SqlResult<()> =
+                SQLAllocHandle(HandleType::Env, Handle::null(), &mut handle)
+                    .into_sql_result("SQLAllocHandle");
             result.on_success(|| Environment {
-                handle: handle as HEnv,
+                handle: handle.as_henv(),
             })
         }
     }
@@ -126,13 +129,20 @@ impl Environment {
 
     /// Allocate a new connection handle. The `Connection` must not outlive the `Environment`.
     pub fn allocate_connection(&self) -> SqlResult<Connection<'_>> {
-        let mut handle = null_mut();
+        let mut handle = Handle::null();
         unsafe {
             SQLAllocHandle(HandleType::Dbc, self.as_handle(), &mut handle)
                 .into_sql_result("SQLAllocHandle")
                 .on_success(|| {
-                    let handle = handle as HDbc;
+                    let handle = handle.as_hdbc();
+                    #[cfg(not(feature = "structured_logging"))]
                     debug!("SQLAllocHandle allocated connection (Dbc) handle '{handle:?}'");
+                    #[cfg(feature = "structured_logging")]
+                    debug!(
+                        target: "odbc_api",
+                        handle:? = handle;
+                        "Connection handle allocated"
+                    );
                     Connection::new(handle)
                 })
         }
@@ -160,8 +170,8 @@ impl Environment {
     ///   ([`FetchOrientation::First`]).
     /// * `buffer_description`: In case `true` is returned this buffer is filled with the
     ///   description of the driver.
-    /// * `buffer_attributes`: In case `true` is returned this buffer is filled with a list of
-    ///   key value attributes. E.g.: `"key1=value1\0key2=value2\0\0"`.
+    /// * `buffer_attributes`: In case `true` is returned this buffer is filled with a list of key
+    ///   value attributes. E.g.: `"key1=value1\0key2=value2\0\0"`.
     ///
     ///  Use [`Environment::drivers_buffer_len`] to determine buffer lengths.
     ///
@@ -174,16 +184,18 @@ impl Environment {
         buffer_description: &mut [SqlChar],
         buffer_attributes: &mut [SqlChar],
     ) -> SqlResult<()> {
-        sql_drivers(
-            self.handle,
-            direction,
-            buffer_description.as_mut_ptr(),
-            buffer_description.len().try_into().unwrap(),
-            null_mut(),
-            buffer_attributes.as_mut_ptr(),
-            buffer_attributes.len().try_into().unwrap(),
-            null_mut(),
-        )
+        unsafe {
+            sql_drivers(
+                self.handle,
+                direction,
+                buffer_description.as_mut_ptr(),
+                buffer_description.len().try_into().unwrap(),
+                null_mut(),
+                buffer_attributes.as_mut_ptr(),
+                buffer_attributes.len().try_into().unwrap(),
+                null_mut(),
+            )
+        }
         .into_sql_result("SQLDrivers")
     }
 
@@ -216,16 +228,18 @@ impl Environment {
         let mut length_description: i16 = 0;
         let mut length_attributes: i16 = 0;
         // Determine required buffer size
-        sql_drivers(
-            self.handle,
-            direction,
-            null_mut(),
-            0,
-            &mut length_description,
-            null_mut(),
-            0,
-            &mut length_attributes,
-        )
+        unsafe {
+            sql_drivers(
+                self.handle,
+                direction,
+                null_mut(),
+                0,
+                &mut length_description,
+                null_mut(),
+                0,
+                &mut length_attributes,
+            )
+        }
         .into_sql_result("SQLDrivers")
         .on_success(|| (length_description, length_attributes))
     }
@@ -258,16 +272,18 @@ impl Environment {
         let mut length_name: i16 = 0;
         let mut length_description: i16 = 0;
         // Determine required buffer size
-        sql_data_sources(
-            self.handle,
-            direction,
-            null_mut(),
-            0,
-            &mut length_name,
-            null_mut(),
-            0,
-            &mut length_description,
-        )
+        unsafe {
+            sql_data_sources(
+                self.handle,
+                direction,
+                null_mut(),
+                0,
+                &mut length_name,
+                null_mut(),
+                0,
+                &mut length_description,
+            )
+        }
         .into_sql_result("SQLDataSources")
         .on_success(|| (length_name, length_description))
     }
@@ -297,16 +313,18 @@ impl Environment {
         buffer_name: &mut [SqlChar],
         buffer_description: &mut [SqlChar],
     ) -> SqlResult<()> {
-        sql_data_sources(
-            self.handle,
-            direction,
-            buffer_name.as_mut_ptr(),
-            buffer_name.len().try_into().unwrap(),
-            null_mut(),
-            buffer_description.as_mut_ptr(),
-            buffer_description.len().try_into().unwrap(),
-            null_mut(),
-        )
+        unsafe {
+            sql_data_sources(
+                self.handle,
+                direction,
+                buffer_name.as_mut_ptr(),
+                buffer_name.len().try_into().unwrap(),
+                null_mut(),
+                buffer_description.as_mut_ptr(),
+                buffer_description.len().try_into().unwrap(),
+                null_mut(),
+            )
+        }
         .into_sql_result("SQLDataSources")
     }
 }

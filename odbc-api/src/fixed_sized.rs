@@ -1,6 +1,7 @@
 use crate::{
+    buffers::{FetchRowMember, Indicator},
     handles::{CData, CDataMut, DataType, HasDataType},
-    parameter::{CElement, OutputParameter}, buffers::{FetchRowMember, Indicator}
+    parameter::{CElement, OutputParameter},
 };
 use odbc_sys::{CDataType, Date, Numeric, Time, Timestamp};
 use std::{
@@ -26,11 +27,7 @@ impl Bit {
     /// assert_eq!(Bit(1), Bit::from_bool(true));
     /// ```
     pub fn from_bool(boolean: bool) -> Self {
-        if boolean {
-            Bit(1)
-        } else {
-            Bit(0)
-        }
+        if boolean { Bit(1) } else { Bit(0) }
     }
 
     /// Maps `1` to `true`, `0` to `false`. Panics if `Bit` should be invalid (not `0` or `1`).
@@ -50,7 +47,7 @@ impl Bit {
 ///
 /// A type implementing this trait, must be a fixed sized type. The information in the `C_DATA_TYPE`
 /// constant must be enough to determine both the size and the buffer length of an Instance.
-pub unsafe trait Pod: Default + Copy + CElement + CDataMut + 'static {
+pub unsafe trait Pod: Default + Copy + CElement + CDataMut + Send + 'static {
     /// ODBC C Data type used to bind instances to a statement.
     const C_DATA_TYPE: CDataType;
 }
@@ -145,6 +142,16 @@ impl_input_fixed_sized!(i32, DataType::Integer);
 impl_input_fixed_sized!(i8, DataType::TinyInt);
 impl_input_fixed_sized!(Bit, DataType::Bit);
 impl_input_fixed_sized!(i64, DataType::BigInt);
+
+/// Numerics relational type takes precision and scale of the instance into account.
+impl HasDataType for Numeric {
+    fn data_type(&self) -> DataType {
+        DataType::Numeric {
+            precision: self.precision as usize,
+            scale: self.scale as i16,
+        }
+    }
+}
 
 // Support for fixed size types, which are not unsigned. Time, Date and timestamp types could be
 // supported, implementation DataType would need to take an instance into account.

@@ -1,14 +1,14 @@
 # ODBC-API
 
 [![Docs](https://docs.rs/odbc-api/badge.svg)](https://docs.rs/odbc-api/)
-[![Licence](https://img.shields.io/crates/l/odbc-api)](https://github.com/pacman82/odbc-api/blob/main/License)
+[![License](https://img.shields.io/crates/l/odbc-api)](https://github.com/pacman82/odbc-api/blob/main/License)
 [![Crates.io](https://img.shields.io/crates/v/odbc-api)](https://crates.io/crates/odbc-api)
 [![Coverage Status](https://coveralls.io/repos/github/pacman82/odbc-api/badge.svg?branch=main)](https://coveralls.io/github/pacman82/odbc-api?branch=main)
 
-Rust ODBC bindings. ODBC (Open Database Connectivity) is an open standard to connect to a variaty of data sources. Most data sources offer ODBC drivers. There are two typical usage scenarios for ODBC:
+Rust ODBC bindings. ODBC (Open Database Connectivity) is an open standard to connect to a variety of data sources. Most data sources offer ODBC drivers. There are two typical usage scenarios for ODBC:
 
-* Your appliciation is designed to work with a wide range of Databases without the need of redeploying it.
-* There is no native Rust driver in suitable quality available for your Database so you want to use the ODBC driver instead.
+* Your application is designed to work with a wide range of databases without the need of redeploying it.
+* There is no native Rust driver in suitable quality available for your database so you want to use the ODBC driver instead.
 
 See also: [Is ODBC the Answer?](https://learn.microsoft.com/en-us/sql/odbc/reference/develop-app/is-odbc-the-answer)
 
@@ -21,7 +21,7 @@ This crate is currently tested against:
 
 Current ODBC Version is `3.80`.
 
-This crate is build on top of the `odbc-sys` ffi bindings, which provide definitions of the ODBC C Interface, but do not build any kind of abstraction on top of it.
+This crate is built on top of the `odbc-sys` ffi bindings, which provide definitions of the ODBC C Interface, but do not build any kind of abstraction on top of it.
 
 ## Usage
 
@@ -29,7 +29,7 @@ Check the [guide](https://docs.rs/odbc-api/latest/odbc_api/guide/index.html) for
 
 ## Installation
 
-To build this library you need to link against the `odbc` library of your systems ODBC driver manager. It should be automatically detected by the build. On Windows systems it is preinstalled. On Linux and OS-X [unix-odbc](http://www.unixodbc.org/) must be installed. To create a Connections to a data source, its ODBC driver must also be installed.
+To build this library you need to link against the `odbc` library of your system's ODBC driver manager. It should be automatically detected by the build. On Windows systems it is preinstalled. On Linux and OS-X [unix-odbc](http://www.unixodbc.org/) must be installed. To create a connection to a data source, its ODBC driver must also be installed.
 
 ### Windows
 
@@ -41,19 +41,23 @@ Nothing to do. ODBC driver manager is preinstalled.
 sudo apt-get install unixodbc-dev
 ```
 
-### OS-X (intel)
+### macOS
 
-You can use homebrew to install UnixODBC
+You can use homebrew to install unixODBC
 
 ```shell
-brew install unixodbc
+sudo brew install unixodbc
 ```
 
-### OS-X (ARM / MAC M1)
+**or**
 
-`cargo build` is not going to pick up `libodbc.so` installed via homebrew due to the fact that homebrew on ARM Mac installs into `/opt/homebrew/Cellar` as opposed to `/usr/local/opt/`.
+You can use MacPorts to install it
 
-You find documentation on what directories are searched during build here: <https://doc.rust-lang.org/cargo/reference/environment-variables.html#dynamic-library-paths>.
+```shell
+sudo port install unixodbc
+```
+
+**or**
 
 You can also install unixODBC from source:
 
@@ -62,7 +66,7 @@ You can also install unixODBC from source:
 3. tar xvf unixODBC*.tar
 4. `./configure`
 5. `make`
-6. `make install`
+6. `sudo make install`
 
 ### Linux / OS-X via Nix Flakes
 
@@ -76,8 +80,8 @@ Alternatively, if you're familiar with the Nix ecosystem or want to try it out, 
 * [x] Log ODBC diagnostics and warnings (via `log` crate).
 * [x] Columnar bulk inserts.
 * [x] Columnar bulk queries.
-* [ ] Rowise bulk inserts.
-* [x] Rowise bulk queries.
+* [ ] Rowwise bulk inserts.
+* [x] Rowwise bulk queries.
 * [x] Output parameters of stored procedures.
 * [x] prepared and 'one shot' queries.
 * [x] Transactions
